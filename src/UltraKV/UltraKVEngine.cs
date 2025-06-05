@@ -1,85 +1,201 @@
 ﻿using System.Collections.Concurrent;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace UltraKV;
 
-public class UltraKVEngine : IDisposable
+public unsafe class UltraKVEngine : IDisposable
 {
-    private readonly string _filePath;
-    private FastFileWriter _writer; // 移除 readonly，收缩时需要重新创建
+    private readonly FileStream _file;
+    private readonly FreeSpaceManager _freeSpaceManager;
+    private readonly DataProcessor _dataProcessor;
+    private readonly ConcurrentDictionary<string, long> _keyIndex;
+    private readonly DatabaseHeader _databaseHeader;
+    private readonly object _writeLock = new object();
+    private bool _disposed;
 
-    // 使用更快的索引结构
-    private readonly ConcurrentDictionary<string, IndexEntry> _index;
-
-    private volatile int _recordCount;
-    private volatile int _deletedCount; // 跟踪删除的记录数
-    private volatile bool _disposed;
-
-    // 内联结构减少内存分配
-    private readonly struct IndexEntry
+    public UltraKVEngine(string filePath, UltraKVConfig? config = null)
     {
-        public readonly long Position;
-        public readonly int Size;
+        config ??= UltraKVConfig.Minimal;
 
-        public IndexEntry(long position, int size)
+        config.Validate();
+
+        var isNewFile = !File.Exists(filePath);
+        _file = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+
+        if (isNewFile)
         {
-            Position = position;
-            Size = size;
+            // 新建数据库
+            _databaseHeader = DatabaseHeader.Create(config);
+            WriteDatabaseHeader();
+        }
+        else
+        {
+            // 打开现有数据库
+            _databaseHeader = ReadDatabaseHeader();
+            if (!_databaseHeader.IsValid())
+            {
+                throw new InvalidDataException("Invalid database file format");
+            }
+
+            // 验证配置兼容性
+            ValidateConfigCompatibility(config);
+        }
+
+        _freeSpaceManager = new FreeSpaceManager(_file, (int)_databaseHeader.FreeSpaceRegionSize);
+        _dataProcessor = new DataProcessor(_databaseHeader, config.EncryptionKey);
+        _keyIndex = new ConcurrentDictionary<string, long>();
+
+        if (!isNewFile)
+        {
+            LoadIndex();
         }
     }
 
-    public UltraKVEngine(string filePath)
+    private void WriteDatabaseHeader()
     {
-        _filePath = filePath;
-        _index = new ConcurrentDictionary<string, IndexEntry>();
-
-        // 先加载索引，再初始化写入器
-        LoadIndex();
-        _writer = new FastFileWriter(filePath);
+        _file.Seek(0, SeekOrigin.Begin);
+        var headerBytes = new byte[DatabaseHeader.SIZE];
+        fixed (byte* headerPtr = headerBytes)
+        {
+            *(DatabaseHeader*)headerPtr = _databaseHeader;
+        }
+        _file.Write(headerBytes, 0, DatabaseHeader.SIZE);
+        _file.Flush();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private DatabaseHeader ReadDatabaseHeader()
+    {
+        if (_file.Length < DatabaseHeader.SIZE)
+        {
+            throw new InvalidDataException("File is too small to contain a valid database header");
+        }
+
+        _file.Seek(0, SeekOrigin.Begin);
+        var buffer = new byte[DatabaseHeader.SIZE];
+        if (_file.Read(buffer, 0, DatabaseHeader.SIZE) != DatabaseHeader.SIZE)
+        {
+            throw new InvalidDataException("Failed to read database header");
+        }
+
+        fixed (byte* bufferPtr = buffer)
+        {
+            return *(DatabaseHeader*)bufferPtr;
+        }
+    }
+
+    private void ValidateConfigCompatibility(UltraKVConfig config)
+    {
+        if (config.CompressionType != _databaseHeader.CompressionType)
+        {
+            throw new InvalidOperationException(
+                $"Compression type mismatch. Database: {_databaseHeader.CompressionType}, Config: {config.CompressionType}");
+        }
+
+        if (config.EncryptionType != _databaseHeader.EncryptionType)
+        {
+            throw new InvalidOperationException(
+                $"Encryption type mismatch. Database: {_databaseHeader.EncryptionType}, Config: {config.EncryptionType}");
+        }
+    }
+
     public void Put(string key, string value)
     {
-        if (_disposed) ThrowDisposed();
+        if (string.IsNullOrEmpty(key))
+            throw new ArgumentException("Key cannot be null or empty");
 
-        var record = new Record(key, value);
-        var position = _writer.Write(record.GetRawData());
+        using var record = new Record(key, value);
+        var rawData = record.GetRawData();
 
-        _index[key] = new IndexEntry(position, record.TotalSize);
-        Interlocked.Increment(ref _recordCount);
+        // 处理数据（压缩+加密）
+        var processedData = _dataProcessor.ProcessData(rawData);
+
+        lock (_writeLock)
+        {
+            // 如果键已存在，标记旧记录为删除
+            if (_keyIndex.TryGetValue(key, out var oldPosition))
+            {
+                MarkAsDeleted(oldPosition);
+            }
+
+            // 寻找合适的空闲空间
+            var requiredSize = processedData.Length;
+            var multipliedSize = (int)(requiredSize * _databaseHeader.AllocationMultiplier);
+
+            long position;
+            if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
+            {
+                position = freeBlock.Position;
+
+                // 如果分配的空间有剩余，加入空闲空间
+                var remainingSize = freeBlock.Size - requiredSize;
+                if (remainingSize > 64) // 小于64字节的碎片忽略
+                {
+                    _freeSpaceManager.AddFreeSpace(position + requiredSize, remainingSize);
+                }
+            }
+            else
+            {
+                // 文件末尾追加
+                position = _file.Length;
+                _file.SetLength(position + multipliedSize);
+            }
+
+            // 写入数据
+            _file.Seek(position, SeekOrigin.Begin);
+            _file.Write(processedData);
+            _file.Flush();
+
+            // 更新索引
+            _keyIndex[key] = position;
+        }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string? Get(string key)
     {
-        if (_disposed) ThrowDisposed();
-
-        if (!_index.TryGetValue(key, out var entry))
+        if (string.IsNullOrEmpty(key) || !_keyIndex.TryGetValue(key, out var position))
             return null;
 
-        // 使用独立的文件流进行读取
         try
         {
-            using var file = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            var buffer = new byte[entry.Size];
+            _file.Seek(position, SeekOrigin.Begin);
 
-            file.Seek(entry.Position, SeekOrigin.Begin);
-            if (file.Read(buffer, 0, entry.Size) != entry.Size)
+            // 先读取原始头部来获取数据大小
+            var headerBuffer = new byte[RecordHeader.SIZE];
+            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
                 return null;
 
-            unsafe
+            fixed (byte* headerPtr = headerBuffer)
             {
-                fixed (byte* ptr = buffer)
+                var header = *(RecordHeader*)headerPtr;
+                if (header.IsDeleted != 0)
                 {
-                    var header = *(RecordHeader*)ptr;
-                    if (header.IsDeleted != 0)
-                        return null;
+                    _keyIndex.TryRemove(key, out _);
+                    return null;
+                }
 
-                    return System.Text.Encoding.UTF8.GetString(
-                        ptr + RecordHeader.SIZE + header.KeyLen,
-                        (int)header.ValueLen);
+                // 计算总数据大小并读取
+                var totalDataSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                var allData = new byte[totalDataSize];
+
+                // 将头部拷贝到完整数据中
+                Array.Copy(headerBuffer, allData, RecordHeader.SIZE);
+
+                // 读取剩余数据
+                var remainingSize = totalDataSize - RecordHeader.SIZE;
+                if (remainingSize > 0)
+                {
+                    _file.Read(allData, RecordHeader.SIZE, remainingSize);
+                }
+
+                // 逆向处理数据（解密+解压缩）
+                var processedData = _dataProcessor.UnprocessData(allData);
+
+                // 解析记录
+                fixed (byte* dataPtr = processedData)
+                {
+                    var record = new Record(dataPtr, processedData.Length);
+                    return record.GetValue();
                 }
             }
         }
@@ -89,408 +205,412 @@ public class UltraKVEngine : IDisposable
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Delete(string key)
     {
-        if (_disposed) ThrowDisposed();
-
-        // 检查键是否存在
-        if (!_index.ContainsKey(key))
+        if (string.IsNullOrEmpty(key) || !_keyIndex.TryGetValue(key, out var position))
             return false;
 
-        var record = new Record(key, "", true);
-        _writer.Write(record.GetRawData());
-
-        _index.TryRemove(key, out _);
-        Interlocked.Increment(ref _deletedCount);
-
-        return true;
+        lock (_writeLock)
+        {
+            MarkAsDeleted(position);
+            _keyIndex.TryRemove(key, out _);
+            return true;
+        }
     }
 
-    // 批量删除
+    /// <summary>
+    /// 检查键是否存在
+    /// </summary>
+    public bool ContainsKey(string key)
+    {
+        if (string.IsNullOrEmpty(key))
+            return false;
+
+        // 首先检查内存索引
+        if (!_keyIndex.ContainsKey(key))
+            return false;
+
+        // 验证记录是否真实存在且未被删除
+        if (_keyIndex.TryGetValue(key, out var position))
+        {
+            try
+            {
+                _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
+                var isDeleted = _file.ReadByte();
+
+                if (isDeleted == 1)
+                {
+                    // 如果记录已删除，从索引中移除
+                    _keyIndex.TryRemove(key, out _);
+                    return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                // 读取失败，从索引中移除
+                _keyIndex.TryRemove(key, out _);
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 批量删除键
+    /// </summary>
     public int DeleteBatch(IEnumerable<string> keys)
     {
-        if (_disposed) ThrowDisposed();
+        if (keys == null)
+            throw new ArgumentNullException(nameof(keys));
 
         var deletedCount = 0;
-        foreach (var key in keys)
+        var keysToDelete = keys.Where(k => !string.IsNullOrEmpty(k)).ToList();
+
+        lock (_writeLock)
         {
-            if (Delete(key))
-                deletedCount++;
+            foreach (var key in keysToDelete)
+            {
+                if (_keyIndex.TryGetValue(key, out var position))
+                {
+                    MarkAsDeleted(position);
+                    _keyIndex.TryRemove(key, out _);
+                    deletedCount++;
+                }
+            }
         }
 
         return deletedCount;
     }
 
-    // 清空所有数据
+    /// <summary>
+    /// 清空所有数据
+    /// </summary>
     public void Clear()
     {
-        if (_disposed) ThrowDisposed();
+        lock (_writeLock)
+        {
+            // 清空内存索引
+            _keyIndex.Clear();
 
-        var allKeys = _index.Keys.ToArray();
-        DeleteBatch(allKeys);
-    }
+            // 重置文件大小到数据开始位置
+            var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
+            _file.SetLength(dataStartPosition);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool ContainsKey(string key) => _index.ContainsKey(key);
+            // 重新初始化空闲空间管理器
+            _freeSpaceManager.Clear();
 
-    // 获取所有键
-    public IEnumerable<string> GetAllKeys()
-    {
-        if (_disposed) ThrowDisposed();
-        return _index.Keys.ToList();
+            // 强制刷新
+            _file.Flush();
+        }
     }
 
     /// <summary>
-    /// 手动收缩数据库，移除已删除的记录，回收磁盘空间
-    /// 修复版本：使用安全的内存操作，避免访问违规
+    /// 强制刷新缓冲区到磁盘
     /// </summary>
-    public ShrinkResult Shrink()
+    public void Flush()
     {
-        if (_disposed) ThrowDisposed();
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var originalFileSize = new FileInfo(_filePath).Length;
-        var tempPath = _filePath + ".shrink";
-        var validRecords = 0;
-        var totalRecordsProcessed = 0;
-
-        try
+        lock (_writeLock)
         {
-            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Starting database shrink...");
+            _file.Flush();
+            _freeSpaceManager.SaveFreeSpaceRegion();
+        }
+    }
 
-            // 创建新的临时文件
-            using var tempWriter = new FastFileWriter(tempPath);
-            var newIndex = new Dictionary<string, IndexEntry>(); // 使用普通Dictionary避免并发问题
+    /// <summary>
+    /// 检查是否应该收缩文件
+    /// </summary>
+    public bool ShouldShrink()
+    {
+        var stats = _freeSpaceManager.GetStats();
+        var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
+        var actualDataSize = _file.Length - dataStartPosition;
 
-            // 安全地读取并重写有效记录
-            using (var reader = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        // 如果空闲空间超过50%且总文件大小超过1MB，建议收缩
+        var freeSpaceRatio = (double)stats.TotalFreeSpace / actualDataSize;
+        return freeSpaceRatio > 0.5 && _file.Length > 1024 * 1024;
+    }
+
+    /// <summary>
+    /// 收缩文件，移除碎片化空间
+    /// </summary>
+    public void Shrink()
+    {
+        lock (_writeLock)
+        {
+            var tempFilePath = _file.Name + ".tmp";
+
+            try
             {
-                var buffer = new byte[64 * 1024];
-                var position = 0L;
+                using var tempFile = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write);
 
-                while (position < reader.Length)
+                // 写入数据库头部
+                var headerBytes = new byte[DatabaseHeader.SIZE];
+                fixed (byte* headerPtr = headerBytes)
                 {
+                    *(DatabaseHeader*)headerPtr = _databaseHeader;
+                }
+                tempFile.Write(headerBytes, 0, DatabaseHeader.SIZE);
+
+                // 创建临时空闲空间管理器
+                using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, (int)_databaseHeader.FreeSpaceRegionSize);
+
+                var newKeyIndex = new ConcurrentDictionary<string, long>();
+                var currentPosition = tempFreeSpaceManager.GetDataStartPosition();
+
+                // 按键顺序重写所有有效记录
+                foreach (var kvp in _keyIndex.OrderBy(x => x.Key))
+                {
+                    var key = kvp.Key;
+                    var oldPosition = kvp.Value;
+
                     try
                     {
-                        reader.Seek(position, SeekOrigin.Begin);
-
-                        // 安全读取记录头
-                        var headerBytes = new byte[RecordHeader.SIZE];
-                        if (reader.Read(headerBytes, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                            break;
-
-                        // 安全解析头部
-                        RecordHeader header;
-                        unsafe
-                        {
-                            fixed (byte* ptr = headerBytes)
-                            {
-                                header = *(RecordHeader*)ptr;
-                            }
-                        }
-
-                        // 验证头部数据的合理性
-                        if (header.KeyLen == 0 || header.KeyLen > 64 * 1024 ||
-                            header.ValueLen > 64 * 1024 * 1024) // 64MB 最大值限制
-                        {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Warning: Invalid header at position {position}, skipping...");
-                            position += RecordHeader.SIZE;
+                        // 读取原记录
+                        _file.Seek(oldPosition, SeekOrigin.Begin);
+                        var headerBuffer = new byte[RecordHeader.SIZE];
+                        if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
                             continue;
-                        }
 
-                        var totalSize = RecordHeader.SIZE + header.KeyLen + header.ValueLen;
-
-                        // 验证记录大小的合理性
-                        if (totalSize > 128 * 1024 * 1024) // 128MB 最大记录限制
+                        fixed (byte* headerPtr = headerBuffer)
                         {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Warning: Record too large ({totalSize} bytes) at position {position}, skipping...");
-                            position += RecordHeader.SIZE;
-                            continue;
+                            var header = *(RecordHeader*)headerPtr;
+                            if (header.IsDeleted != 0)
+                                continue; // 跳过已删除的记录
+
+                            var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                            var recordData = new byte[totalSize];
+
+                            // 读取完整记录
+                            _file.Seek(oldPosition, SeekOrigin.Begin);
+                            if (_file.Read(recordData, 0, totalSize) != totalSize)
+                                continue;
+
+                            // 写入到新文件
+                            tempFile.Seek(currentPosition, SeekOrigin.Begin);
+                            tempFile.Write(recordData);
+
+                            // 更新新索引
+                            newKeyIndex[key] = currentPosition;
+                            currentPosition += totalSize;
                         }
-
-                        // 确保缓冲区足够大
-                        if (totalSize > buffer.Length)
-                        {
-                            buffer = new byte[totalSize];
-                        }
-
-                        // 重新定位并读取完整记录
-                        reader.Seek(position, SeekOrigin.Begin);
-                        var bytesRead = reader.Read(buffer, 0, (int)totalSize);
-
-                        if (bytesRead != totalSize)
-                        {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Warning: Incomplete record at position {position}, expected {totalSize} bytes, got {bytesRead}");
-                            break;
-                        }
-
-                        totalRecordsProcessed++;
-
-                        // 安全解析记录内容
-                        string key;
-                        bool isDeleted;
-
-                        try
-                        {
-                            unsafe
-                            {
-                                fixed (byte* dataPtr = buffer)
-                                {
-                                    var recordHeader = *(RecordHeader*)dataPtr;
-                                    isDeleted = recordHeader.IsDeleted != 0;
-
-                                    // 安全提取键
-                                    var keyBytes = new byte[recordHeader.KeyLen];
-                                    Marshal.Copy((IntPtr)(dataPtr + RecordHeader.SIZE), keyBytes, 0, (int)recordHeader.KeyLen);
-                                    key = System.Text.Encoding.UTF8.GetString(keyBytes);
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Warning: Failed to parse record at position {position}: {ex.Message}");
-                            position += totalSize;
-                            continue;
-                        }
-
-                        // 只保留未删除且在当前索引中的记录
-                        if (!isDeleted && _index.ContainsKey(key))
-                        {
-                            try
-                            {
-                                var recordData = new byte[totalSize];
-                                Array.Copy(buffer, 0, recordData, 0, (int)totalSize);
-
-                                var newPosition = tempWriter.Write(recordData);
-                                newIndex[key] = new IndexEntry(newPosition, (int)totalSize);
-                                validRecords++;
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Warning: Failed to write record for key '{key}': {ex.Message}");
-                            }
-                        }
-
-                        position += totalSize;
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Error processing record at position {position}: {ex.Message}");
-                        // 尝试跳过当前记录
-                        position += Math.Max(RecordHeader.SIZE, 1);
+                        // 跳过有问题的记录
+                        continue;
+                    }
+                }
 
-                        // 如果错误太多，停止处理
-                        if (++totalRecordsProcessed > 1000000) // 防止无限循环
+                // 设置新文件大小
+                tempFile.SetLength(currentPosition);
+                tempFile.Flush();
+
+                // 关闭原文件并替换
+                var originalPath = _file.Name;
+                _file.Close();
+
+                File.Delete(originalPath);
+                File.Move(tempFilePath, originalPath);
+
+                // 重新打开文件
+                var newFile = new FileStream(originalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+                typeof(UltraKVEngine).GetField("_file", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(this, newFile);
+
+                // 更新索引
+                _keyIndex.Clear();
+                foreach (var kvp in newKeyIndex)
+                {
+                    _keyIndex[kvp.Key] = kvp.Value;
+                }
+
+                // 重新初始化空闲空间管理器
+                _freeSpaceManager.Clear();
+            }
+            catch (Exception ex)
+            {
+                // 清理临时文件
+                if (File.Exists(tempFilePath))
+                {
+                    try { File.Delete(tempFilePath); } catch { }
+                }
+                throw new InvalidOperationException($"Shrink operation failed: {ex.Message}", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 获取数据库统计信息
+    /// </summary>
+    public DatabaseStats GetStats()
+    {
+        var freeSpaceStats = _freeSpaceManager.GetStats();
+        var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
+        var actualDataSize = _file.Length - dataStartPosition;
+
+        // 计算实际使用的数据大小
+        long totalRecordSize = 0;
+        int validRecordCount = 0;
+        int deletedRecordCount = 0;
+
+        foreach (var position in _keyIndex.Values)
+        {
+            try
+            {
+                _file.Seek(position, SeekOrigin.Begin);
+                var headerBuffer = new byte[RecordHeader.SIZE];
+                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
+                {
+                    fixed (byte* headerPtr = headerBuffer)
+                    {
+                        var header = *(RecordHeader*)headerPtr;
+                        var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+
+                        if (header.IsDeleted == 0)
                         {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Too many errors, stopping shrink operation");
-                            break;
+                            totalRecordSize += recordSize;
+                            validRecordCount++;
+                        }
+                        else
+                        {
+                            deletedRecordCount++;
                         }
                     }
                 }
             }
-
-            tempWriter.Flush();
-            tempWriter.Dispose();
-
-            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Processed {totalRecordsProcessed} records, kept {validRecords} valid records");
-
-            // 关闭当前写入器
-            _writer.Dispose();
-
-            // 等待文件句柄完全释放
-            // 判断是否需要等待文件句柄释放
-            Thread.Sleep(10);
-
-            // 原子替换文件
-            if (File.Exists(_filePath))
+            catch
             {
-                var backupPath = _filePath + ".backup";
-                File.Move(_filePath, backupPath); // 先备份原文件
-
-                try
-                {
-                    File.Move(tempPath, _filePath);
-                    File.Delete(backupPath); // 删除备份
-                }
-                catch
-                {
-                    // 如果失败，恢复原文件
-                    if (File.Exists(backupPath))
-                        File.Move(backupPath, _filePath);
-                    throw;
-                }
+                // 忽略读取错误
             }
-            else
-            {
-                File.Move(tempPath, _filePath);
-            }
-
-            // 重新初始化写入器和索引
-            _writer = new FastFileWriter(_filePath);
-            _index.Clear();
-
-            foreach (var kvp in newIndex)
-            {
-                _index[kvp.Key] = kvp.Value;
-            }
-
-            // 重置计数器
-            _recordCount = validRecords;
-            _deletedCount = 0;
-
-            sw.Stop();
-            var newFileSize = new FileInfo(_filePath).Length;
-            var spaceSaved = originalFileSize - newFileSize;
-
-            var result = new ShrinkResult
-            {
-                OriginalFileSize = originalFileSize,
-                NewFileSize = newFileSize,
-                SpaceSaved = spaceSaved,
-                ValidRecords = validRecords,
-                TotalRecordsProcessed = totalRecordsProcessed,
-                ElapsedMilliseconds = sw.ElapsedMilliseconds,
-                SpaceSavedPercentage = originalFileSize > 0 ? (double)spaceSaved / originalFileSize * 100 : 0
-            };
-
-            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Shrink completed: {spaceSaved / 1024.0:F1} KB saved ({result.SpaceSavedPercentage:F1}%) in {sw.ElapsedMilliseconds}ms");
-
-            return result;
         }
-        catch (Exception ex)
+
+        return new DatabaseStats
         {
-            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Shrink failed: {ex.Message}");
+            Header = _databaseHeader,
+            KeyCount = _keyIndex.Count,
+            ValidRecordCount = validRecordCount,
+            DeletedRecordCount = deletedRecordCount,
+            TotalFileSize = _file.Length,
+            DataRegionSize = actualDataSize,
+            UsedDataSize = totalRecordSize,
+            FreeSpaceStats = freeSpaceStats,
+            CompressionRatio = CalculateCompressionRatio(),
+            FragmentationRatio = freeSpaceStats.FragmentationRatio,
+            SpaceUtilization = actualDataSize > 0 ? (double)totalRecordSize / actualDataSize : 0.0
+        };
+    }
 
-            // 清理临时文件
-            try
+    private double CalculateCompressionRatio()
+    {
+        if (_databaseHeader.CompressionType == CompressionType.None)
+            return 1.0;
+
+        // 简化的压缩比计算，实际应该基于压缩前后的数据大小
+        return _databaseHeader.CompressionType switch
+        {
+            CompressionType.Gzip => 0.6,
+            CompressionType.Deflate => 0.65,
+            CompressionType.Brotli => 0.55,
+            _ => 1.0
+        };
+    }
+
+    private void MarkAsDeleted(long position)
+    {
+        try
+        {
+            _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
+            _file.WriteByte(1);
+
+            // 计算记录大小并加入空闲空间
+            _file.Seek(position, SeekOrigin.Begin);
+            var headerBuffer = new byte[RecordHeader.SIZE];
+            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
             {
-                if (File.Exists(tempPath))
-                    File.Delete(tempPath);
+                fixed (byte* headerPtr = headerBuffer)
+                {
+                    var header = *(RecordHeader*)headerPtr;
+                    var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                    _freeSpaceManager.AddFreeSpace(position, recordSize);
+                }
             }
-            catch { }
-
-            // 尝试重新初始化写入器
-            try
-            {
-                if (_writer == null)
-                    _writer = new FastFileWriter(_filePath);
-            }
-            catch { }
-
-            throw;
+        }
+        catch
+        {
+            // 忽略错误
         }
     }
-
-    /// <summary>
-    /// 异步收缩数据库
-    /// </summary>
-    public async Task<ShrinkResult> ShrinkAsync()
-    {
-        return await Task.Run(Shrink);
-    }
-
-    /// <summary>
-    /// 检查是否建议进行收缩
-    /// </summary>
-    public bool ShouldShrink(double threshold = 0.15)
-    {
-        if (_recordCount == 0 || _deletedCount == 0)
-            return false;
-
-        var deletionRatio = (double)_deletedCount / _recordCount;
-        return deletionRatio >= threshold;
-    }
-
-    public void Flush() => _writer.Flush();
 
     private void LoadIndex()
     {
-        if (!File.Exists(_filePath))
-            return;
+        var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
+        var position = dataStartPosition;
 
-        try
+        while (position < _file.Length)
         {
-            using var file = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            var buffer = new byte[64 * 1024];
-            var position = 0L;
-
-            while (position < file.Length)
+            try
             {
-                file.Seek(position, SeekOrigin.Begin);
+                _file.Seek(position, SeekOrigin.Begin);
 
-                if (file.Read(buffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
+                var headerBuffer = new byte[RecordHeader.SIZE];
+                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
                     break;
 
-                unsafe
+                fixed (byte* headerPtr = headerBuffer)
                 {
-                    fixed (byte* ptr = buffer)
+                    var header = *(RecordHeader*)headerPtr;
+                    var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+
+                    if (header.IsDeleted == 0)
                     {
-                        var header = *(RecordHeader*)ptr;
-                        var totalSize = RecordHeader.SIZE + header.KeyLen + header.ValueLen;
-
-                        if (totalSize > buffer.Length)
+                        // 读取完整记录
+                        var recordData = new byte[totalSize];
+                        _file.Seek(position, SeekOrigin.Begin);
+                        if (_file.Read(recordData, 0, totalSize) == totalSize)
                         {
-                            buffer = new byte[totalSize];
-                            file.Seek(position, SeekOrigin.Begin);
-                        }
+                            // 逆向处理数据
+                            var processedData = _dataProcessor.UnprocessData(recordData);
 
-                        if (file.Read(buffer, 0, (int)totalSize) == totalSize)
-                        {
-                            fixed (byte* dataPtr = buffer)
+                            fixed (byte* dataPtr = processedData)
                             {
-                                var recordHeader = *(RecordHeader*)dataPtr;
-                                var key = System.Text.Encoding.UTF8.GetString(
-                                    dataPtr + RecordHeader.SIZE,
-                                    (int)recordHeader.KeyLen);
-
-                                if (recordHeader.IsDeleted != 0)
-                                {
-                                    _index.TryRemove(key, out _);
-                                    _deletedCount++;
-                                }
-                                else
-                                {
-                                    _index[key] = new IndexEntry(position, (int)totalSize);
-                                }
+                                var record = new Record(dataPtr, processedData.Length);
+                                var key = record.GetKey();
+                                _keyIndex[key] = position;
                             }
                         }
-
-                        position += totalSize;
-                        _recordCount++;
                     }
+                    else
+                    {
+                        // 已删除的记录，加入空闲空间
+                        _freeSpaceManager.AddFreeSpace(position, totalSize);
+                    }
+
+                    position += totalSize;
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Warning: Failed to load index from {_filePath}: {ex.Message}");
+            catch
+            {
+                break;
+            }
         }
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(UltraKVEngine));
-
-    public EngineStats GetStats()
+    public IEnumerable<string> GetAllKeys()
     {
-        var fileSize = 0L;
-        try
-        {
-            fileSize = new FileInfo(_filePath).Length;
-        }
-        catch { }
+        return _keyIndex.Keys.ToList();
+    }
 
-        var deletionRatio = _recordCount > 0 && _deletedCount > 0 ?
-            (double)_deletedCount / _recordCount : 0;
-
-        return new EngineStats
+    public DatabaseInfo GetDatabaseInfo()
+    {
+        var stats = _freeSpaceManager.GetStats();
+        return new DatabaseInfo
         {
-            RecordCount = _recordCount,
-            DeletedCount = _deletedCount,
-            IndexSize = _index.Count,
-            FileSize = fileSize,
-            DeletionRatio = deletionRatio,
-            ShrinkRecommended = ShouldShrink()
+            Header = _databaseHeader,
+            KeyCount = _keyIndex.Count,
+            FileSize = _file.Length,
+            FreeSpaceStats = stats
         };
     }
 
@@ -498,9 +618,64 @@ public class UltraKVEngine : IDisposable
     {
         if (!_disposed)
         {
-            _writer?.Dispose();
+            // 更新最后访问时间
+            var updatedHeader = _databaseHeader;
+            updatedHeader.UpdateAccessTime();
+
+            _file.Seek(0, SeekOrigin.Begin);
+            var headerBytes = new ReadOnlySpan<byte>(&updatedHeader, DatabaseHeader.SIZE);
+            _file.Write(headerBytes);
+
+            _freeSpaceManager?.Dispose();
+            _dataProcessor?.Dispose();
+            _file?.Dispose();
             _disposed = true;
         }
+    }
+}
+
+/// <summary>
+/// 详细的数据库统计信息
+/// </summary>
+public struct DatabaseStats
+{
+    public DatabaseHeader Header;
+    public int KeyCount;
+    public int ValidRecordCount;
+    public int DeletedRecordCount;
+    public long TotalFileSize;
+    public long DataRegionSize;
+    public long UsedDataSize;
+    public FreeSpaceStats FreeSpaceStats;
+    public double CompressionRatio;
+    public double FragmentationRatio;
+    public double SpaceUtilization;
+
+    public readonly long WastedSpace => FreeSpaceStats.TotalFreeSpace;
+    public readonly bool IsFragmented => FragmentationRatio > 0.3;
+    public readonly bool ShouldShrink => SpaceUtilization < 0.5 && TotalFileSize > 1024 * 1024;
+
+    public override readonly string ToString()
+    {
+        return $"Keys: {KeyCount} (Valid: {ValidRecordCount}, Deleted: {DeletedRecordCount}), " +
+               $"Size: {TotalFileSize / 1024.0:F1}KB, Used: {UsedDataSize / 1024.0:F1}KB, " +
+               $"Free: {WastedSpace / 1024.0:F1}KB, Utilization: {SpaceUtilization:P1}, " +
+               $"Compression: {CompressionRatio:P1}, Fragmentation: {FragmentationRatio:P1}";
+    }
+}
+
+public struct DatabaseInfo
+{
+    public DatabaseHeader Header;
+    public int KeyCount;
+    public long FileSize;
+    public FreeSpaceStats FreeSpaceStats;
+
+    public override string ToString()
+    {
+        return $"Keys: {KeyCount}, Size: {FileSize / 1024.0:F1}KB, " +
+               $"Compression: {Header.CompressionType}, Encryption: {Header.EncryptionType}, " +
+               $"Created: {DateTimeOffset.FromUnixTimeMilliseconds(Header.CreatedTime):yyyy-MM-dd HH:mm:ss}";
     }
 }
 

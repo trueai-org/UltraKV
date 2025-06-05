@@ -20,7 +20,7 @@ namespace UltraKV
         /// <param name="plaintext">明文数据</param>
         /// <param name="key">加密密钥</param>
         /// <returns>加密后的数据，包括nonce、密文和tag</returns>
-        public static byte[] EncryptWithAES256GCM(byte[] plaintext, string key, byte[] nonce = null)
+        public static byte[] EncryptWithAES256GCM(byte[] plaintext, string key, byte[]? nonce = null)
         {
             // 生成AES-GCM加密实例，指定标签大小
             using AesGcm aesGcm = new AesGcm(GenerateKey(key), AesGcmTagSize);
@@ -175,6 +175,41 @@ namespace UltraKV
 
             // 对输入的字符串进行哈希，确保密钥长度为32字节
             return sha256.ComputeHash(Encoding.UTF8.GetBytes(key.PadRight(32).Substring(0, 32)));
+        }
+
+        /// <summary>
+        /// 加密数据
+        /// </summary>
+        /// <param name="result"></param>
+        /// <param name="encryptionType"></param>
+        /// <param name="encryptionKey"></param>
+        /// <returns></returns>
+        internal static byte[] Encrypt(byte[] result, EncryptionType encryptionType, string encryptionKey)
+        {
+            return encryptionType switch
+            {
+                EncryptionType.AES256GCM => EncryptWithAES256GCM(result, encryptionKey),
+                EncryptionType.ChaCha20Poly1305 => EncryptWithChaCha20Poly1305(result, encryptionKey),
+                _ => throw new NotSupportedException($"Unsupported encryption type: {encryptionType}")
+            };
+        }
+
+        /// <summary>
+        /// 解密数据
+        /// </summary>
+        /// <param name="result"></param>
+        /// <param name="encryptionType"></param>
+        /// <param name="encryptionKey"></param>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        internal static byte[] Decrypt(byte[] result, EncryptionType encryptionType, string encryptionKey)
+        {
+            return encryptionType switch
+            {
+                EncryptionType.AES256GCM => DecryptWithAES256GCM(result, encryptionKey),
+                EncryptionType.ChaCha20Poly1305 => DecryptWithChaCha20Poly1305(result, encryptionKey),
+                _ => throw new NotSupportedException($"Unsupported encryption type: {encryptionType}")
+            };
         }
     }
 }

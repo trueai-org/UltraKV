@@ -23,14 +23,91 @@ namespace UltraKV
 
             using var manager = new UltraKVManager(dataDir);
 
-            var bigValue = ""; // new string('x', 1024 * 4); // ""; // new string('x', 1024 * 4); // 4K 大小的值
+            var bigValue = new string('x', 1024 * 1); // ""; // new string('x', 1024 * 4); // 4K 大小的值
 
             try
             {
-                var engine = manager.GetEngine("benchmark");
-
                 const int WARM_UP = 1000;
                 const int ITERATIONS = 50_000; // 减少测试量避免文件锁定
+                var sw = Stopwatch.StartNew();
+
+                //========数据库压缩与不压缩测试============
+                var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig { EncryptionType = EncryptionType.AES256GCM, EncryptionKey = Guid.NewGuid().ToString() });
+                var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig { EncryptionType = EncryptionType.None });
+
+                // 显示初始统计信息
+                Console.WriteLine("=== Initial Stats ===");
+                Console.WriteLine($"Compressed Engine Stats: {engine1.GetStats()}");
+                Console.WriteLine($"Uncompressed Engine Stats: {engine2.GetStats()}");
+
+                // 预热
+                Console.WriteLine("Warming up compressed engine...");
+                for (int i = 0; i < 1000; i++)
+                {
+                    engine1.Put($"warmup_{i}", $"value_{bigValue}{i}");
+                    var x1 = engine1.Get($"warmup_{i}"); // 预热读取
+                }
+                engine1.Flush();
+                Console.WriteLine("Warming up uncompressed engine...");
+
+                for (int i = 0; i < 1000; i++)
+                {
+                    engine2.Put($"warmup_{i}", $"value_{bigValue}{i}");
+                    var x1 = engine2.Get($"warmup_{i}"); // 预热读取
+
+                }
+                engine2.Flush();
+
+                Console.WriteLine($"Compressed Engine Stats after warmup: {engine1.GetStats()}");
+                Console.WriteLine($"Uncompressed Engine Stats after warmup: {engine2.GetStats()}");
+
+
+                // 压缩测试
+                Console.WriteLine("\n=== Write Performance (Compressed) ===");
+                sw.Start();
+                for (int i = 0; i < ITERATIONS; i++)
+                {
+                    engine1.Put($"key_{i}", $"{bigValue}test_value_number_{i}_with_some_additional_data");
+                    // 每1000次操作刷写一次
+                    if (i % 1000 == 0)
+                    {
+                        engine1.Flush();
+                    }
+                }
+                engine1.Flush(); // 最终刷写
+                sw.Stop();
+
+                var writeOpsPerSecCompressed = ITERATIONS * 1000.0 / sw.ElapsedMilliseconds;
+                Console.WriteLine($"Compressed Write {ITERATIONS:N0} records: {sw.ElapsedMilliseconds}ms");
+                Console.WriteLine($"Compressed Write Performance: {writeOpsPerSecCompressed:N0} ops/sec");
+                Console.WriteLine($"After Compressed Write - {engine1.GetStats()}");
+
+                // 不压缩测试
+                Console.WriteLine("\n=== Write Performance (Uncompressed) ===");
+                sw.Restart();
+                for (int i = 0; i < ITERATIONS; i++)
+                {
+                    engine2.Put($"key_{i}", $"{bigValue}test_value_number_{i}_with_some_additional_data");
+                    // 每1000次操作刷写一次
+                    if (i % 1000 == 0)
+                    {
+                        engine2.Flush();
+                    }
+                }
+                engine2.Flush(); // 最终刷写
+                sw.Stop();
+                var writeOpsPerSecUncompressed = ITERATIONS * 1000.0 / sw.ElapsedMilliseconds;
+                Console.WriteLine($"Uncompressed Write {ITERATIONS:N0} records: {sw.ElapsedMilliseconds}ms");
+                Console.WriteLine($"Uncompressed Write Performance: {writeOpsPerSecUncompressed:N0} ops/sec");
+                Console.WriteLine($"After Uncompressed Write - {engine2.GetStats()}");
+
+
+
+
+                //=================================
+
+                var engine = manager.GetEngine("benchmark");
+
 
                 // 预热
                 Console.WriteLine("Warming up...");
@@ -40,7 +117,7 @@ namespace UltraKV
                 }
 
                 Console.WriteLine("\n=== Write Performance ===");
-                var sw = Stopwatch.StartNew();
+
 
                 for (int i = 0; i < ITERATIONS; i++)
                 {
@@ -75,7 +152,7 @@ namespace UltraKV
                     engine.Flush();
                 }
 
-                var  key0value = engine.Get("key_0");
+                var key0value = engine.Get("key_0");
 
                 sw.Stop();
                 var updateOpsPerSec1 = WARM_UP * 1000.0 / sw.ElapsedMilliseconds;
@@ -200,10 +277,10 @@ namespace UltraKV
                     Console.WriteLine($"Before Shrink - {statsBeforeShrink}");
 
                     sw.Restart();
-                    var shrinkResult = engine.Shrink();
+                    engine.Shrink(); //  var shrinkResult =
                     sw.Stop();
 
-                    Console.WriteLine($"Shrink Result: {shrinkResult}");
+                    Console.WriteLine($"Shrink Result: {engine.GetStats()}");
 
                     var statsAfterShrink = engine.GetStats();
                     Console.WriteLine($"After Shrink - {statsAfterShrink}");
@@ -232,7 +309,7 @@ namespace UltraKV
                 else
                 {
                     Console.WriteLine("\n=== Shrink Not Needed ===");
-                    Console.WriteLine($"Deletion ratio too low for shrinking (current: {engine.GetStats().DeletionRatio:P1})");
+                    Console.WriteLine($"Deletion ratio too low for shrinking (current: {engine.GetStats()})");
                 }
 
                 // =================== 新增：更新已删除键的测试 ===================
@@ -305,7 +382,7 @@ namespace UltraKV
                 }
 
                 var statsBeforeClear = clearEngine.GetStats();
-                Console.WriteLine($"Before Clear - Records: {statsBeforeClear.IndexSize}, File: {statsBeforeClear.FileSize / 1024.0:F1} KB");
+                Console.WriteLine($"Before Clear - Records: {statsBeforeClear}");
 
                 sw.Restart();
                 clearEngine.Clear();
@@ -315,27 +392,27 @@ namespace UltraKV
                 Console.WriteLine($"Clear 5,000 records: {sw.ElapsedMilliseconds}ms");
                 Console.WriteLine($"After Clear - {statsAfterClear}");
 
-                // =================== 新增：异步收缩测试 ===================
-                if (clearEngine.ShouldShrink())
-                {
-                    Console.WriteLine("\n=== Async Shrink Test ===");
-                    sw.Restart();
-                    var asyncShrinkResult = await clearEngine.ShrinkAsync();
-                    sw.Stop();
+                //// =================== 新增：异步收缩测试 ===================
+                //if (clearEngine.ShouldShrink())
+                //{
+                //    Console.WriteLine("\n=== Async Shrink Test ===");
+                //    sw.Restart();
+                //    var asyncShrinkResult = await clearEngine.ShrinkAsync();
+                //    sw.Stop();
 
-                    Console.WriteLine($"Async Shrink Result: {asyncShrinkResult}");
-                }
+                //    Console.WriteLine($"Async Shrink Result: {asyncShrinkResult}");
+                //}
 
-                // 最终统计信息
-                var finalStats = engine.GetStats();
-                Console.WriteLine("\n=== Final Stats ===");
-                Console.WriteLine($"Final Engine Stats: {finalStats}");
-                Console.WriteLine($"Records: {finalStats.RecordCount:N0}");
-                Console.WriteLine($"Deleted: {finalStats.DeletedCount:N0}");
-                Console.WriteLine($"Index Size: {finalStats.IndexSize:N0}");
-                Console.WriteLine($"File Size: {finalStats.FileSize / 1024.0 / 1024.0:F2} MB");
-                Console.WriteLine($"Deletion Ratio: {finalStats.DeletionRatio:P1}");
-                Console.WriteLine($"Shrink Recommended: {finalStats.ShrinkRecommended}");
+                //// 最终统计信息
+                //var finalStats = engine.GetStats();
+                //Console.WriteLine("\n=== Final Stats ===");
+                //Console.WriteLine($"Final Engine Stats: {finalStats}");
+                //Console.WriteLine($"Records: {finalStats.RecordCount:N0}");
+                //Console.WriteLine($"Deleted: {finalStats.DeletedCount:N0}");
+                //Console.WriteLine($"Index Size: {finalStats.IndexSize:N0}");
+                //Console.WriteLine($"File Size: {finalStats.FileSize / 1024.0 / 1024.0:F2} MB");
+                //Console.WriteLine($"Deletion Ratio: {finalStats.DeletionRatio:P1}");
+                //Console.WriteLine($"Shrink Recommended: {finalStats.ShrinkRecommended}");
 
                 // 内存使用
                 GC.Collect();

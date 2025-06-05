@@ -19,14 +19,14 @@ public class UltraKVManager : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public UltraKVEngine GetEngine(string name)
+    public UltraKVEngine GetEngine(string name, UltraKVConfig? config = null)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(UltraKVManager));
 
-        return _engines.GetOrAdd(name, CreateEngine);
+        return _engines.GetOrAdd(name, CreateEngine(name,config));
     }
 
-    private UltraKVEngine CreateEngine(string name)
+    private UltraKVEngine CreateEngine(string name, UltraKVConfig? config = null)
     {
         _createLock.EnterWriteLock();
         try
@@ -36,7 +36,7 @@ public class UltraKVManager : IDisposable
                 return existing;
 
             var path = Path.Combine(_basePath, $"{name}.ultradb");
-            return new UltraKVEngine(path);
+            return new UltraKVEngine(path,config);
         }
         finally
         {
