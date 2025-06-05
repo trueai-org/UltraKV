@@ -32,8 +32,13 @@ namespace UltraKV
                 var sw = Stopwatch.StartNew();
 
                 //========数据库压缩与不压缩测试============
-                var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig { EncryptionType = EncryptionType.AES256GCM, EncryptionKey = "MyFixedTestKey12345678901234567890" });
-                var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig { EncryptionType = EncryptionType.None });
+                var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig
+                {
+                    CompressionType = CompressionType.Gzip,
+                    EncryptionType = EncryptionType.AES256GCM,
+                    EncryptionKey = "MyFixedTestKey12345678901234567890"
+                });
+                var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig { CompressionType = CompressionType.Gzip });
 
                 // 显示初始统计信息
                 Console.WriteLine("=== Initial Stats ===");

@@ -14,10 +14,34 @@ public unsafe class UltraKVEngine : IDisposable
     private readonly object _writeLock = new object();
     private bool _disposed;
 
+    /// <summary>
+    /// 加密数据头部结构
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct EncryptedDataHeader
+    {
+        public uint OriginalSize;    // 4 bytes - 原始数据大小（压缩/加密前）
+        public uint EncryptedSize;   // 4 bytes - 加密数据大小
+        public byte IsDeleted;       // 1 byte - 删除标记
+        public byte Reserved1;       // 1 byte - 保留
+        public ushort Reserved2;     // 2 bytes - 保留
+                                     // Total: 12 bytes
+
+        public const int SIZE = 12;
+
+        public EncryptedDataHeader(uint originalSize, uint encryptedSize, bool isDeleted = false)
+        {
+            OriginalSize = originalSize;
+            EncryptedSize = encryptedSize;
+            IsDeleted = isDeleted ? (byte)1 : (byte)0;
+            Reserved1 = 0;
+            Reserved2 = 0;
+        }
+    }
+
     public UltraKVEngine(string filePath, UltraKVConfig? config = null)
     {
         config ??= UltraKVConfig.Minimal;
-
         config.Validate();
 
         var isNewFile = !File.Exists(filePath);
@@ -107,9 +131,6 @@ public unsafe class UltraKVEngine : IDisposable
         using var record = new Record(key, value);
         var rawData = record.GetRawData();
 
-        // 处理数据（压缩+加密）
-        var processedData = _dataProcessor.ProcessData(rawData);
-
         lock (_writeLock)
         {
             // 如果键已存在，标记旧记录为删除
@@ -118,35 +139,78 @@ public unsafe class UltraKVEngine : IDisposable
                 MarkAsDeleted(oldPosition);
             }
 
-            // 寻找合适的空闲空间
-            var requiredSize = processedData.Length;
-            var multipliedSize = (int)(requiredSize * _databaseHeader.AllocationMultiplier);
-
             long position;
-            if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
-            {
-                position = freeBlock.Position;
 
-                // 如果分配的空间有剩余，加入空闲空间
-                var remainingSize = freeBlock.Size - requiredSize;
-                if (remainingSize > 64) // 小于64字节的碎片忽略
+            if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+            {
+                // 加密/压缩模式：使用新的存储格式
+                var processedData = _dataProcessor.ProcessData(rawData);
+
+                var encryptedHeader = new EncryptedDataHeader
                 {
-                    _freeSpaceManager.AddFreeSpace(position + requiredSize, remainingSize);
+                    OriginalSize = (uint)rawData.Length,
+                    EncryptedSize = (uint)processedData.Length,
+                    IsDeleted = 0,
+                    Reserved1 = 0,
+                    Reserved2 = 0
+                };
+
+                var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
+                var multipliedSize = (int)(totalSize * _databaseHeader.AllocationMultiplier);
+
+                // 寻找合适的空闲空间
+                if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
+                {
+                    position = freeBlock.Position;
+                    var remainingSize = freeBlock.Size - totalSize;
+                    if (remainingSize > 64)
+                    {
+                        _freeSpaceManager.AddFreeSpace(position + totalSize, remainingSize);
+                    }
                 }
+                else
+                {
+                    position = _file.Length;
+                    _file.SetLength(position + multipliedSize);
+                }
+
+                // 写入加密数据头部 + 加密数据
+                _file.Seek(position, SeekOrigin.Begin);
+                var headerBytes = new byte[EncryptedDataHeader.SIZE];
+                fixed (byte* headerPtr = headerBytes)
+                {
+                    *(EncryptedDataHeader*)headerPtr = encryptedHeader;
+                }
+                _file.Write(headerBytes, 0, EncryptedDataHeader.SIZE);
+                _file.Write(processedData);
             }
             else
             {
-                // 文件末尾追加
-                position = _file.Length;
-                _file.SetLength(position + multipliedSize);
+                // 非加密模式：使用原有格式
+                var requiredSize = rawData.Length;
+                var multipliedSize = (int)(requiredSize * _databaseHeader.AllocationMultiplier);
+
+                if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
+                {
+                    position = freeBlock.Position;
+                    var remainingSize = freeBlock.Size - requiredSize;
+                    if (remainingSize > 64)
+                    {
+                        _freeSpaceManager.AddFreeSpace(position + requiredSize, remainingSize);
+                    }
+                }
+                else
+                {
+                    position = _file.Length;
+                    _file.SetLength(position + multipliedSize);
+                }
+
+                // 直接写入原始数据
+                _file.Seek(position, SeekOrigin.Begin);
+                _file.Write(rawData);
             }
 
-            // 写入数据
-            _file.Seek(position, SeekOrigin.Begin);
-            _file.Write(processedData);
             _file.Flush();
-
-            // 更新索引
             _keyIndex[key] = position;
         }
     }
@@ -160,47 +224,75 @@ public unsafe class UltraKVEngine : IDisposable
         {
             _file.Seek(position, SeekOrigin.Begin);
 
-            // 先读取原始头部来获取数据大小
-            var headerBuffer = new byte[RecordHeader.SIZE];
-            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                return null;
-
-            fixed (byte* headerPtr = headerBuffer)
+            if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
             {
-                var header = *(RecordHeader*)headerPtr;
-                if (header.IsDeleted != 0)
-                {
-                    _keyIndex.TryRemove(key, out _);
+                // 加密/压缩模式：读取加密数据头部
+                var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
+                if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
                     return null;
-                }
 
-                // 计算总数据大小并读取
-                var totalDataSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-                var allData = new byte[totalDataSize];
-
-                // 将头部拷贝到完整数据中
-                Array.Copy(headerBuffer, allData, RecordHeader.SIZE);
-
-                // 读取剩余数据
-                var remainingSize = totalDataSize - RecordHeader.SIZE;
-                if (remainingSize > 0)
+                fixed (byte* headerPtr = encryptedHeaderBuffer)
                 {
-                    _file.Read(allData, RecordHeader.SIZE, remainingSize);
+                    var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
+                    if (encryptedHeader.IsDeleted != 0)
+                    {
+                        _keyIndex.TryRemove(key, out _);
+                        return null;
+                    }
+
+                    // 读取加密数据
+                    var encryptedData = new byte[encryptedHeader.EncryptedSize];
+                    if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) != encryptedHeader.EncryptedSize)
+                        return null;
+
+                    // 解密+解压缩
+                    var processedData = _dataProcessor.UnprocessData(encryptedData);
+
+                    // 解析记录
+                    fixed (byte* dataPtr = processedData)
+                    {
+                        var record = new Record(dataPtr, processedData.Length);
+                        return record.GetValue();
+                    }
                 }
+            }
+            else
+            {
+                // 非加密模式：使用原有逻辑
+                var headerBuffer = new byte[RecordHeader.SIZE];
+                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
+                    return null;
 
-                // 逆向处理数据（解密+解压缩）
-                var processedData = _dataProcessor.UnprocessData(allData);
-
-                // 解析记录
-                fixed (byte* dataPtr = processedData)
+                fixed (byte* headerPtr = headerBuffer)
                 {
-                    var record = new Record(dataPtr, processedData.Length);
-                    return record.GetValue();
+                    var header = *(RecordHeader*)headerPtr;
+                    if (header.IsDeleted != 0)
+                    {
+                        _keyIndex.TryRemove(key, out _);
+                        return null;
+                    }
+
+                    var totalDataSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                    var allData = new byte[totalDataSize];
+
+                    Array.Copy(headerBuffer, allData, RecordHeader.SIZE);
+                    var remainingSize = totalDataSize - RecordHeader.SIZE;
+                    if (remainingSize > 0)
+                    {
+                        _file.Read(allData, RecordHeader.SIZE, remainingSize);
+                    }
+
+                    fixed (byte* dataPtr = allData)
+                    {
+                        var record = new Record(dataPtr, allData.Length);
+                        return record.GetValue();
+                    }
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"Error reading key '{key}': {ex.Message}");
             return null;
         }
     }
@@ -218,29 +310,153 @@ public unsafe class UltraKVEngine : IDisposable
         }
     }
 
-    /// <summary>
-    /// 检查键是否存在
-    /// </summary>
+    private void MarkAsDeleted(long position)
+    {
+        try
+        {
+            if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+            {
+                // 加密模式：标记EncryptedDataHeader的IsDeleted字段
+                _file.Seek(position + 8, SeekOrigin.Begin); // 跳到IsDeleted字段 (OriginalSize(4) + EncryptedSize(4))
+                _file.WriteByte(1);
+            }
+            else
+            {
+                // 非加密模式：标记RecordHeader的IsDeleted字段
+                _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
+                _file.WriteByte(1);
+            }
+        }
+        catch
+        {
+            // 忽略错误
+        }
+    }
+
+    private void LoadIndex()
+    {
+        var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
+        var position = dataStartPosition;
+
+        while (position < _file.Length)
+        {
+            try
+            {
+                _file.Seek(position, SeekOrigin.Begin);
+
+                if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+                {
+                    // 加密模式：读取EncryptedDataHeader
+                    var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
+                    if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
+                        break;
+
+                    fixed (byte* headerPtr = encryptedHeaderBuffer)
+                    {
+                        var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
+                        var totalSize = EncryptedDataHeader.SIZE + (int)encryptedHeader.EncryptedSize;
+
+                        if (encryptedHeader.IsDeleted == 0)
+                        {
+                            // 读取加密数据
+                            var encryptedData = new byte[encryptedHeader.EncryptedSize];
+                            if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) == encryptedHeader.EncryptedSize)
+                            {
+                                try
+                                {
+                                    // 解密+解压缩
+                                    var processedData = _dataProcessor.UnprocessData(encryptedData);
+
+                                    fixed (byte* dataPtr = processedData)
+                                    {
+                                        var record = new Record(dataPtr, processedData.Length);
+                                        var key = record.GetKey();
+                                        _keyIndex[key] = position;
+                                    }
+                                }
+                                catch
+                                {
+                                    // 解密失败，跳过
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 已删除的记录，加入空闲空间
+                            _freeSpaceManager.AddFreeSpace(position, totalSize);
+                        }
+
+                        position += totalSize;
+                    }
+                }
+                else
+                {
+                    // 非加密模式：使用原有逻辑
+                    var headerBuffer = new byte[RecordHeader.SIZE];
+                    if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
+                        break;
+
+                    fixed (byte* headerPtr = headerBuffer)
+                    {
+                        var header = *(RecordHeader*)headerPtr;
+                        var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+
+                        if (header.IsDeleted == 0)
+                        {
+                            var recordData = new byte[totalSize];
+                            _file.Seek(position, SeekOrigin.Begin);
+                            if (_file.Read(recordData, 0, totalSize) == totalSize)
+                            {
+                                fixed (byte* dataPtr = recordData)
+                                {
+                                    var record = new Record(dataPtr, recordData.Length);
+                                    var key = record.GetKey();
+                                    _keyIndex[key] = position;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            _freeSpaceManager.AddFreeSpace(position, totalSize);
+                        }
+
+                        position += totalSize;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading index at position {position}: {ex.Message}");
+                break;
+            }
+        }
+    }
+
     public bool ContainsKey(string key)
     {
         if (string.IsNullOrEmpty(key))
             return false;
 
-        // 首先检查内存索引
         if (!_keyIndex.ContainsKey(key))
             return false;
 
-        // 验证记录是否真实存在且未被删除
         if (_keyIndex.TryGetValue(key, out var position))
         {
             try
             {
-                _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
+                if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+                {
+                    _file.Seek(position + 8, SeekOrigin.Begin); // EncryptedDataHeader.IsDeleted位置
+                }
+                else
+                {
+                    _file.Seek(position + 16, SeekOrigin.Begin); // RecordHeader.IsDeleted位置
+                }
+
                 var isDeleted = _file.ReadByte();
 
                 if (isDeleted == 1)
                 {
-                    // 如果记录已删除，从索引中移除
                     _keyIndex.TryRemove(key, out _);
                     return false;
                 }
@@ -249,7 +465,6 @@ public unsafe class UltraKVEngine : IDisposable
             }
             catch
             {
-                // 读取失败，从索引中移除
                 _keyIndex.TryRemove(key, out _);
                 return false;
             }
@@ -258,9 +473,6 @@ public unsafe class UltraKVEngine : IDisposable
         return false;
     }
 
-    /// <summary>
-    /// 批量删除键
-    /// </summary>
     public int DeleteBatch(IEnumerable<string> keys)
     {
         if (keys == null)
@@ -285,31 +497,18 @@ public unsafe class UltraKVEngine : IDisposable
         return deletedCount;
     }
 
-    /// <summary>
-    /// 清空所有数据
-    /// </summary>
     public void Clear()
     {
         lock (_writeLock)
         {
-            // 清空内存索引
             _keyIndex.Clear();
-
-            // 重置文件大小到数据开始位置
             var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
             _file.SetLength(dataStartPosition);
-
-            // 重新初始化空闲空间管理器
             _freeSpaceManager.Clear();
-
-            // 强制刷新
             _file.Flush();
         }
     }
 
-    /// <summary>
-    /// 强制刷新缓冲区到磁盘
-    /// </summary>
     public void Flush()
     {
         lock (_writeLock)
@@ -319,28 +518,29 @@ public unsafe class UltraKVEngine : IDisposable
         }
     }
 
-    /// <summary>
-    /// 检查是否应该收缩文件
-    /// </summary>
     public bool ShouldShrink()
     {
         var stats = _freeSpaceManager.GetStats();
         var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
         var actualDataSize = _file.Length - dataStartPosition;
 
-        // 如果空闲空间超过50%且总文件大小超过1MB，建议收缩
-        var freeSpaceRatio = (double)stats.TotalFreeSpace / actualDataSize;
+        var freeSpaceRatio = actualDataSize > 0 ? (double)stats.TotalFreeSpace / actualDataSize : 0.0;
         return freeSpaceRatio > 0.5 && _file.Length > 1024 * 1024;
     }
 
     /// <summary>
-    /// 收缩文件，移除碎片化空间
+    /// 收缩文件，移除碎片化空间，支持加密和非加密格式
     /// </summary>
-    public void Shrink()
+    public ShrinkResult Shrink()
     {
         lock (_writeLock)
         {
+            var startTime = DateTimeOffset.UtcNow;
+            var originalFileSize = _file.Length;
             var tempFilePath = _file.Name + ".tmp";
+
+            int validRecords = 0;
+            int totalRecordsProcessed = 0;
 
             try
             {
@@ -365,41 +565,78 @@ public unsafe class UltraKVEngine : IDisposable
                 {
                     var key = kvp.Key;
                     var oldPosition = kvp.Value;
+                    totalRecordsProcessed++;
 
                     try
                     {
-                        // 读取原记录
                         _file.Seek(oldPosition, SeekOrigin.Begin);
-                        var headerBuffer = new byte[RecordHeader.SIZE];
-                        if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                            continue;
 
-                        fixed (byte* headerPtr = headerBuffer)
+                        if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
                         {
-                            var header = *(RecordHeader*)headerPtr;
-                            if (header.IsDeleted != 0)
-                                continue; // 跳过已删除的记录
-
-                            var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-                            var recordData = new byte[totalSize];
-
-                            // 读取完整记录
-                            _file.Seek(oldPosition, SeekOrigin.Begin);
-                            if (_file.Read(recordData, 0, totalSize) != totalSize)
+                            // 加密模式：读取 EncryptedDataHeader
+                            var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
+                            if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
                                 continue;
 
-                            // 写入到新文件
-                            tempFile.Seek(currentPosition, SeekOrigin.Begin);
-                            tempFile.Write(recordData);
+                            fixed (byte* headerPtr = encryptedHeaderBuffer)
+                            {
+                                var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
+                                if (encryptedHeader.IsDeleted != 0)
+                                    continue; // 跳过已删除的记录
 
-                            // 更新新索引
-                            newKeyIndex[key] = currentPosition;
-                            currentPosition += totalSize;
+                                var totalSize = EncryptedDataHeader.SIZE + (int)encryptedHeader.EncryptedSize;
+
+                                // 读取完整的加密数据块
+                                var fullEncryptedData = new byte[totalSize];
+                                _file.Seek(oldPosition, SeekOrigin.Begin);
+                                if (_file.Read(fullEncryptedData, 0, totalSize) != totalSize)
+                                    continue;
+
+                                // 写入到新文件
+                                tempFile.Seek(currentPosition, SeekOrigin.Begin);
+                                tempFile.Write(fullEncryptedData);
+
+                                // 更新新索引
+                                newKeyIndex[key] = currentPosition;
+                                currentPosition += totalSize;
+                                validRecords++;
+                            }
+                        }
+                        else
+                        {
+                            // 非加密模式：读取 RecordHeader
+                            var headerBuffer = new byte[RecordHeader.SIZE];
+                            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
+                                continue;
+
+                            fixed (byte* headerPtr = headerBuffer)
+                            {
+                                var header = *(RecordHeader*)headerPtr;
+                                if (header.IsDeleted != 0)
+                                    continue; // 跳过已删除的记录
+
+                                var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                                var recordData = new byte[totalSize];
+
+                                // 读取完整记录
+                                _file.Seek(oldPosition, SeekOrigin.Begin);
+                                if (_file.Read(recordData, 0, totalSize) != totalSize)
+                                    continue;
+
+                                // 写入到新文件
+                                tempFile.Seek(currentPosition, SeekOrigin.Begin);
+                                tempFile.Write(recordData);
+
+                                // 更新新索引
+                                newKeyIndex[key] = currentPosition;
+                                currentPosition += totalSize;
+                                validRecords++;
+                            }
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // 跳过有问题的记录
+                        Console.WriteLine($"Warning: Failed to process record '{key}' during shrink: {ex.Message}");
                         continue;
                     }
                 }
@@ -428,6 +665,23 @@ public unsafe class UltraKVEngine : IDisposable
 
                 // 重新初始化空闲空间管理器
                 _freeSpaceManager.Clear();
+
+                var endTime = DateTimeOffset.UtcNow;
+                var elapsedMs = (long)(endTime - startTime).TotalMilliseconds;
+                var newFileSize = _file.Length;
+                var spaceSaved = originalFileSize - newFileSize;
+                var spaceSavedPercentage = originalFileSize > 0 ? (double)spaceSaved / originalFileSize * 100 : 0;
+
+                return new ShrinkResult
+                {
+                    OriginalFileSize = originalFileSize,
+                    NewFileSize = newFileSize,
+                    SpaceSaved = spaceSaved,
+                    SpaceSavedPercentage = spaceSavedPercentage,
+                    ValidRecords = validRecords,
+                    TotalRecordsProcessed = totalRecordsProcessed,
+                    ElapsedMilliseconds = elapsedMs
+                };
             }
             catch (Exception ex)
             {
@@ -442,7 +696,7 @@ public unsafe class UltraKVEngine : IDisposable
     }
 
     /// <summary>
-    /// 获取数据库统计信息
+    /// 获取详细的数据库统计信息，支持加密和非加密格式
     /// </summary>
     public DatabaseStats GetStats()
     {
@@ -452,39 +706,82 @@ public unsafe class UltraKVEngine : IDisposable
 
         // 计算实际使用的数据大小
         long totalRecordSize = 0;
+        long totalOriginalSize = 0; // 解密前的原始大小
         int validRecordCount = 0;
         int deletedRecordCount = 0;
+        var compressionSavings = new List<double>();
 
         foreach (var position in _keyIndex.Values)
         {
             try
             {
                 _file.Seek(position, SeekOrigin.Begin);
-                var headerBuffer = new byte[RecordHeader.SIZE];
-                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
-                {
-                    fixed (byte* headerPtr = headerBuffer)
-                    {
-                        var header = *(RecordHeader*)headerPtr;
-                        var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
 
-                        if (header.IsDeleted == 0)
+                if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+                {
+                    // 加密模式：读取 EncryptedDataHeader
+                    var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
+                    if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) == EncryptedDataHeader.SIZE)
+                    {
+                        fixed (byte* headerPtr = encryptedHeaderBuffer)
                         {
-                            totalRecordSize += recordSize;
-                            validRecordCount++;
+                            var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
+                            var recordSize = EncryptedDataHeader.SIZE + (int)encryptedHeader.EncryptedSize;
+
+                            if (encryptedHeader.IsDeleted == 0)
+                            {
+                                totalRecordSize += recordSize;
+                                totalOriginalSize += encryptedHeader.OriginalSize;
+                                validRecordCount++;
+
+                                // 计算压缩比
+                                if (encryptedHeader.OriginalSize > 0)
+                                {
+                                    var compressionRatio = (double)encryptedHeader.EncryptedSize / encryptedHeader.OriginalSize;
+                                    compressionSavings.Add(compressionRatio);
+                                }
+                            }
+                            else
+                            {
+                                deletedRecordCount++;
+                            }
                         }
-                        else
+                    }
+                }
+                else
+                {
+                    // 非加密模式：读取 RecordHeader
+                    var headerBuffer = new byte[RecordHeader.SIZE];
+                    if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
+                    {
+                        fixed (byte* headerPtr = headerBuffer)
                         {
-                            deletedRecordCount++;
+                            var header = *(RecordHeader*)headerPtr;
+                            var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+
+                            if (header.IsDeleted == 0)
+                            {
+                                totalRecordSize += recordSize;
+                                totalOriginalSize += recordSize; // 非加密模式下两者相同
+                                validRecordCount++;
+                            }
+                            else
+                            {
+                                deletedRecordCount++;
+                            }
                         }
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Warning: Failed to read record at position {position}: {ex.Message}");
                 // 忽略读取错误
             }
         }
+
+        // 计算实际压缩比
+        var actualCompressionRatio = compressionSavings.Count > 0 ? compressionSavings.Average() : CalculateCompressionRatio();
 
         return new DatabaseStats
         {
@@ -495,106 +792,45 @@ public unsafe class UltraKVEngine : IDisposable
             TotalFileSize = _file.Length,
             DataRegionSize = actualDataSize,
             UsedDataSize = totalRecordSize,
+            OriginalDataSize = totalOriginalSize, // 新增：原始数据大小（解密前）
             FreeSpaceStats = freeSpaceStats,
-            CompressionRatio = CalculateCompressionRatio(),
+            CompressionRatio = actualCompressionRatio,
             FragmentationRatio = freeSpaceStats.FragmentationRatio,
-            SpaceUtilization = actualDataSize > 0 ? (double)totalRecordSize / actualDataSize : 0.0
+            SpaceUtilization = actualDataSize > 0 ? (double)totalRecordSize / actualDataSize : 0.0,
+            EncryptionOverhead = CalculateEncryptionOverhead(totalOriginalSize, totalRecordSize),
+            AverageRecordSize = validRecordCount > 0 ? (double)totalRecordSize / validRecordCount : 0.0
         };
     }
 
+    /// <summary>
+    /// 计算理论压缩比（用于无法获取实际压缩数据时的估算）
+    /// </summary>
     private double CalculateCompressionRatio()
     {
         if (_databaseHeader.CompressionType == CompressionType.None)
             return 1.0;
 
-        // 简化的压缩比计算，实际应该基于压缩前后的数据大小
+        // 基于算法特性的理论压缩比
         return _databaseHeader.CompressionType switch
         {
-            CompressionType.Gzip => 0.6,
-            CompressionType.Deflate => 0.65,
-            CompressionType.Brotli => 0.55,
+            CompressionType.Gzip => 0.65,      // 一般文本压缩到65%
+            CompressionType.Deflate => 0.70,   // 稍差于Gzip
+            CompressionType.Brotli => 0.55,    // 最好的压缩比
             _ => 1.0
         };
     }
 
-    private void MarkAsDeleted(long position)
+    /// <summary>
+    /// 计算加密开销
+    /// </summary>
+    private double CalculateEncryptionOverhead(long originalSize, long encryptedSize)
     {
-        try
-        {
-            _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
-            _file.WriteByte(1);
+        if (_databaseHeader.EncryptionType == EncryptionType.None || originalSize == 0)
+            return 0.0;
 
-            // 计算记录大小并加入空闲空间
-            _file.Seek(position, SeekOrigin.Begin);
-            var headerBuffer = new byte[RecordHeader.SIZE];
-            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
-            {
-                fixed (byte* headerPtr = headerBuffer)
-                {
-                    var header = *(RecordHeader*)headerPtr;
-                    var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-                    _freeSpaceManager.AddFreeSpace(position, recordSize);
-                }
-            }
-        }
-        catch
-        {
-            // 忽略错误
-        }
-    }
-
-    private void LoadIndex()
-    {
-        var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
-        var position = dataStartPosition;
-
-        while (position < _file.Length)
-        {
-            try
-            {
-                _file.Seek(position, SeekOrigin.Begin);
-
-                var headerBuffer = new byte[RecordHeader.SIZE];
-                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                    break;
-
-                fixed (byte* headerPtr = headerBuffer)
-                {
-                    var header = *(RecordHeader*)headerPtr;
-                    var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-
-                    if (header.IsDeleted == 0)
-                    {
-                        // 读取完整记录
-                        var recordData = new byte[totalSize];
-                        _file.Seek(position, SeekOrigin.Begin);
-                        if (_file.Read(recordData, 0, totalSize) == totalSize)
-                        {
-                            // 逆向处理数据
-                            var processedData = _dataProcessor.UnprocessData(recordData);
-
-                            fixed (byte* dataPtr = processedData)
-                            {
-                                var record = new Record(dataPtr, processedData.Length);
-                                var key = record.GetKey();
-                                _keyIndex[key] = position;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // 已删除的记录，加入空闲空间
-                        _freeSpaceManager.AddFreeSpace(position, totalSize);
-                    }
-
-                    position += totalSize;
-                }
-            }
-            catch
-            {
-                break;
-            }
-        }
+        // 加密开销 = (加密后大小 - 原始大小) / 原始大小
+        var overhead = (double)(encryptedSize - originalSize) / originalSize;
+        return Math.Max(0.0, overhead); // 确保不为负数
     }
 
     public IEnumerable<string> GetAllKeys()
@@ -618,7 +854,6 @@ public unsafe class UltraKVEngine : IDisposable
     {
         if (!_disposed)
         {
-            // 更新最后访问时间
             var updatedHeader = _databaseHeader;
             updatedHeader.UpdateAccessTime();
 
@@ -635,7 +870,7 @@ public unsafe class UltraKVEngine : IDisposable
 }
 
 /// <summary>
-/// 详细的数据库统计信息
+/// 详细的数据库统计信息（更新版本）
 /// </summary>
 public struct DatabaseStats
 {
@@ -646,21 +881,46 @@ public struct DatabaseStats
     public long TotalFileSize;
     public long DataRegionSize;
     public long UsedDataSize;
+    public long OriginalDataSize;        // 新增：原始数据大小（压缩/加密前）
     public FreeSpaceStats FreeSpaceStats;
     public double CompressionRatio;
     public double FragmentationRatio;
     public double SpaceUtilization;
+    public double EncryptionOverhead;    // 新增：加密开销
+    public double AverageRecordSize;     // 新增：平均记录大小
 
     public readonly long WastedSpace => FreeSpaceStats.TotalFreeSpace;
     public readonly bool IsFragmented => FragmentationRatio > 0.3;
     public readonly bool ShouldShrink => SpaceUtilization < 0.5 && TotalFileSize > 1024 * 1024;
+    public readonly double CompressionSavings => OriginalDataSize > 0 ? 1.0 - CompressionRatio : 0.0;
+    public readonly double TotalSpaceEfficiency => OriginalDataSize > 0 ? (double)UsedDataSize / OriginalDataSize : 1.0;
 
     public override readonly string ToString()
     {
-        return $"Keys: {KeyCount} (Valid: {ValidRecordCount}, Deleted: {DeletedRecordCount}), " +
-               $"Size: {TotalFileSize / 1024.0:F1}KB, Used: {UsedDataSize / 1024.0:F1}KB, " +
-               $"Free: {WastedSpace / 1024.0:F1}KB, Utilization: {SpaceUtilization:P1}, " +
-               $"Compression: {CompressionRatio:P1}, Fragmentation: {FragmentationRatio:P1}";
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== Database Statistics ===");
+        sb.AppendLine($"Records: {KeyCount} (Valid: {ValidRecordCount}, Deleted: {DeletedRecordCount})");
+        sb.AppendLine($"File Size: {TotalFileSize / 1024.0:F1} KB");
+        sb.AppendLine($"Used Data: {UsedDataSize / 1024.0:F1} KB");
+
+        if (OriginalDataSize > 0 && OriginalDataSize != UsedDataSize)
+        {
+            sb.AppendLine($"Original Size: {OriginalDataSize / 1024.0:F1} KB");
+            sb.AppendLine($"Compression: {CompressionRatio:P1} ({CompressionSavings:P1} saved)");
+        }
+
+        if (Header.EncryptionType != EncryptionType.None)
+        {
+            sb.AppendLine($"Encryption Overhead: {EncryptionOverhead:P1}");
+        }
+
+        sb.AppendLine($"Free Space: {WastedSpace / 1024.0:F1} KB");
+        sb.AppendLine($"Space Utilization: {SpaceUtilization:P1}");
+        sb.AppendLine($"Fragmentation: {FragmentationRatio:P1}");
+        sb.AppendLine($"Average Record Size: {AverageRecordSize:F1} bytes");
+        sb.AppendLine($"Shrink Recommended: {ShouldShrink}");
+
+        return sb.ToString();
     }
 }
 
