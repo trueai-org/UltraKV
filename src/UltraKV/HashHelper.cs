@@ -329,7 +329,7 @@ namespace MDriveSync.Security
         /// <param name="algorithm">哈希算法名称</param>
         /// <param name="length">要计算哈希的长度，如果为null则计算到流末尾</param>
         /// <returns>哈希值的字节数组</returns>
-        public static byte[] ComputeStreamHash(Stream stream, string algorithm, int? length = null)
+        public static byte[]? ComputeStreamHash(Stream stream, string algorithm, int? length = null)
         {
             if (stream == null)
                 throw new ArgumentNullException(nameof(stream));
@@ -413,7 +413,7 @@ namespace MDriveSync.Security
         /// <summary>
         /// 使用指定的哈希算法计算流中指定长度数据的哈希值
         /// </summary>
-        private static byte[] ComputeHashWithLength(Stream stream, HashAlgorithm hashAlgorithm, int? length)
+        private static byte[]? ComputeHashWithLength(Stream stream, HashAlgorithm hashAlgorithm, int? length)
         {
             if (!length.HasValue)
             {

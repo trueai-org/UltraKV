@@ -9,7 +9,7 @@ namespace UltraKV
         private const int ChaCha20NonceSize = 12; // 96-bit nonce
         private const int ChaCha20TagSize = 16;   // 128-bit tag
 
-        public static byte[] EncryptChaCha20Poly1305(byte[] plaintext, byte[] key, byte[] nonce = null)
+        public static byte[] EncryptChaCha20Poly1305(byte[] plaintext, byte[] key, byte[]? nonce = null)
         {
             if (nonce == null)
             {

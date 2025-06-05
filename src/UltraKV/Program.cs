@@ -4,7 +4,7 @@ namespace UltraKV
 {
     internal class Program
     {
-        private static async Task Main(string[] args)
+        private static void Main(string[] args)
         {
             Console.WriteLine("UltraKV Performance Benchmark - With Delete & Shrink Tests");
             Console.WriteLine($"Started at: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
@@ -32,7 +32,7 @@ namespace UltraKV
                 var sw = Stopwatch.StartNew();
 
                 //========数据库压缩与不压缩测试============
-                var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig { EncryptionType = EncryptionType.AES256GCM, EncryptionKey = Guid.NewGuid().ToString() });
+                var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig { EncryptionType = EncryptionType.AES256GCM, EncryptionKey = "MyFixedTestKey12345678901234567890" });
                 var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig { EncryptionType = EncryptionType.None });
 
                 // 显示初始统计信息

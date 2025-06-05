@@ -87,7 +87,7 @@ namespace UltraKV
         /// <param name="plaintext">明文数据</param>
         /// <param name="key">加密密钥</param>
         /// <returns>加密后的数据，包括nonce、密文和tag</returns>
-        public static byte[] EncryptWithChaCha20Poly1305(byte[] plaintext, string key, byte[] nonce = null)
+        public static byte[] EncryptWithChaCha20Poly1305(byte[] plaintext, string key, byte[]? nonce = null)
         {
             if (ChaCha20Poly1305.IsSupported)
             {
