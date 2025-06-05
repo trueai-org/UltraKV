@@ -5,7 +5,7 @@ namespace UltraKV
     /// <summary>
     /// 压缩解压函数
     /// 推荐算法：LZ4/Zstd/Snappy
-    /// 支持算法：LZ4/Zstd/Snappy/LZMA/Deflate/Brotli
+    /// 支持算法：LZ4/Zstd/Snappy/LZMA/Deflate/Brotli/Gzip
     /// </summary>
     public static class CompressionHelper
     {
@@ -26,6 +26,7 @@ namespace UltraKV
                 "LZMA" => LZMACompressor.Shared.Compress(buffer),
                 "Deflate" => DeflateCompressor.Shared.Compress(buffer),
                 "Brotli" => BrotliCompressor.Shared.Compress(buffer),
+                "Gzip" => GZipCompressor.Shared.Compress(buffer),
                 _ => buffer
             };
 
@@ -49,6 +50,7 @@ namespace UltraKV
                 "LZMA" => LZMACompressor.Shared.Decompress(buffer),
                 "Deflate" => DeflateCompressor.Shared.Decompress(buffer),
                 "Brotli" => BrotliCompressor.Shared.Decompress(buffer),
+                "Gzip" => GZipCompressor.Shared.Decompress(buffer),
                 _ => buffer
             };
 
