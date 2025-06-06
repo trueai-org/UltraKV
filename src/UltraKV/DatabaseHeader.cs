@@ -68,11 +68,14 @@ public struct DatabaseHeader
             GcMinRecordCount = Math.Min(config.GcMinRecordCount, ushort.MaxValue),
             WriteBufferSizeKB = config.WriteBufferSizeKB,
             ReadBufferSizeKB = config.ReadBufferSizeKB,
-            GcMinFileSizeKB = config.GcMinFileSizeKB, // 存储为KB
+            DefaultIndexPageSizeKB = config.DefaultIndexPageSizeKB,
+            GcMinFileSizeKB = config.GcMinFileSizeKB,
+            MaxKeyLength = config.MaxKeyLength,
             GcFlushInterval = Math.Min(config.GcFlushInterval, ushort.MaxValue),
             GcAutoRecycleEnabled = config.GcAutoRecycleEnabled ? (byte)1 : (byte)0,
             EnableFreeSpaceReuse = config.EnableFreeSpaceReuse ? (byte)1 : (byte)0,
             EnableMemoryMode = config.EnableMemoryMode ? (byte)1 : (byte)0,
+            EnableUpdateValidation = config.EnableUpdateValidation ? (byte)1 : (byte)0,
             CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             LastAccessTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             GcLastTime = 0,
@@ -82,7 +85,9 @@ public struct DatabaseHeader
             Reserved3 = 0,
             Reserved4 = 0,
             Reserved5 = 0,
-            Reserved6 = 0
+            Reserved6 = 0,
+            Reserved7 = 0,
+            Reserved8 = 0
         };
 
         header.Checksum = CalculateChecksum(header);

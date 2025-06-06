@@ -24,6 +24,7 @@ namespace UltraKV
             using var manager = new UltraKVManager(dataDir);
 
             var bigValue = new string('x', 1024 * 1); // ""; // new string('x', 1024 * 4); // 4K 大小的值
+            var bigKey = ""; // new string('k', 1024 * 4); // ""; // new string('k', 1024 * 4); // 4K 大小的键
 
             try
             {
@@ -34,12 +35,15 @@ namespace UltraKV
                 //========数据库压缩与不压缩测试============
                 var engine1 = manager.GetEngine("benchmark_compressed", new UltraKVConfig
                 {
+                    EnableUpdateValidation = true,
                     CompressionType = CompressionType.Gzip,
                     EncryptionType = EncryptionType.AES256GCM,
-                    EncryptionKey = "MyFixedTestKey12345678901234567890"
+                    EncryptionKey = "MyFixedTestKey12345678901234567890",
+                    EnableFreeSpaceReuse = false,
                 });
                 var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig
                 {
+                    EnableUpdateValidation = true,
                     CompressionType = CompressionType.Brotli
                 });
 
@@ -52,8 +56,8 @@ namespace UltraKV
                 Console.WriteLine("Warming up compressed engine...");
                 for (int i = 0; i < 1000; i++)
                 {
-                    engine1.Put($"warmup_{i}", $"value_{bigValue}{i}");
-                    var x1 = engine1.Get($"warmup_{i}"); // 预热读取
+                    engine1.Put($"{bigKey}warmup_{i}", $"value_{bigValue}{i}");
+                    var x1 = engine1.Get($"{bigKey}warmup_{i}"); // 预热读取
                 }
                 engine1.Flush();
                 Console.WriteLine("Warming up uncompressed engine...");

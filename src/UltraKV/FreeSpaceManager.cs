@@ -10,7 +10,7 @@ public struct FreeBlock
 {
     public long Position;           // 8 bytes - 文件位置
     public long Size;               // 8 bytes - 块大小
-                                   // Total: 16 bytes
+                                    // Total: 16 bytes
 
     public const int SIZE = 16;
 
@@ -47,7 +47,7 @@ internal struct FreeSpaceHeader
     public uint Magic;              // 4 bytes - 魔法数字
     public int BlockCount;          // 4 bytes - 空闲块数量
     public long RegionSize;          // 8 bytes - 区域大小
-                                    // Total: 16 bytes
+                                     // Total: 16 bytes
 
     public const uint MAGIC_NUMBER = 0x46535053; // "FSPS" - Free Space
     public const int SIZE = 16;
@@ -65,21 +65,39 @@ public unsafe class FreeSpaceManager : IDisposable
     private readonly byte* _regionBuffer;
     private readonly List<FreeBlock> _freeBlocks;
     private readonly object _lock = new object();
+    private readonly bool _enableFreeSpaceReuse; // 新增：是否启用空闲空间重用
     private bool _disposed;
     private bool _isDirty;
 
-    public FreeSpaceManager(FileStream file, int regionSize)
+    public FreeSpaceManager(FileStream file, int regionSize, bool enableFreeSpaceReuse = true)
     {
         _file = file;
         _regionSize = regionSize;
+        _enableFreeSpaceReuse = enableFreeSpaceReuse;
         _regionBuffer = (byte*)Marshal.AllocHGlobal(regionSize);
         _freeBlocks = new List<FreeBlock>();
 
-        LoadFreeSpaceRegion();
+        // 只有启用空闲空间重用时才加载
+        if (_enableFreeSpaceReuse)
+        {
+            LoadFreeSpaceRegion();
+        }
+        else
+        {
+            // 禁用时，初始化空的区域
+            InitializeFreeSpaceRegion();
+        }
     }
 
+    /// <summary>
+    /// 添加空闲空间
+    /// </summary>
     public void AddFreeSpace(long position, long size)
     {
+        // 如果禁用空闲空间重用，直接返回，不记录空闲空间
+        if (!_enableFreeSpaceReuse)
+            return;
+
         if (position < GetDataStartPosition() || size <= 0)
             return;
 
@@ -97,7 +115,6 @@ public unsafe class FreeSpaceManager : IDisposable
                 }
             }
 
-
             // 合并所有相邻块
             var mergedBlock = newBlock;
             for (int i = toMerge.Count - 1; i >= 0; i--)
@@ -111,17 +128,23 @@ public unsafe class FreeSpaceManager : IDisposable
             _freeBlocks.Sort((a, b) => a.Size.CompareTo(b.Size));
 
             EnsureSpaceCapacity();
-
             _isDirty = true;
         }
     }
 
+    /// <summary>
+    /// 尝试获取空闲空间
+    /// </summary>
     public bool TryGetFreeSpace(int requiredSize, out FreeBlock block)
     {
+        block = default;
+
+        // 如果禁用空闲空间重用，总是返回 false，强制追加到文件末尾
+        if (!_enableFreeSpaceReuse)
+            return false;
+
         lock (_lock)
         {
-            block = default;
-
             for (int i = 0; i < _freeBlocks.Count; i++)
             {
                 if (_freeBlocks[i].Size >= requiredSize)
@@ -239,17 +262,21 @@ public unsafe class FreeSpaceManager : IDisposable
                 var header = new FreeSpaceHeader
                 {
                     Magic = FreeSpaceHeader.MAGIC_NUMBER,
-                    BlockCount = _freeBlocks.Count,
+                    BlockCount = _enableFreeSpaceReuse ? _freeBlocks.Count : 0, // 禁用时记录为0
                     RegionSize = _regionSize
                 };
 
                 *(FreeSpaceHeader*)_regionBuffer = header;
 
-                var blockPtr = _regionBuffer + FreeSpaceHeader.SIZE;
-                for (int i = 0; i < _freeBlocks.Count; i++)
+                // 只有启用时才写入空闲块数据
+                if (_enableFreeSpaceReuse)
                 {
-                    *(FreeBlock*)blockPtr = _freeBlocks[i];
-                    blockPtr += FreeBlock.SIZE;
+                    var blockPtr = _regionBuffer + FreeSpaceHeader.SIZE;
+                    for (int i = 0; i < _freeBlocks.Count; i++)
+                    {
+                        *(FreeBlock*)blockPtr = _freeBlocks[i];
+                        blockPtr += FreeBlock.SIZE;
+                    }
                 }
 
                 _file.Seek(DatabaseHeader.SIZE, SeekOrigin.Begin);
@@ -272,29 +299,22 @@ public unsafe class FreeSpaceManager : IDisposable
     {
         lock (_lock)
         {
-            var totalFreeSpace = _freeBlocks.Sum(b => (long)b.Size);
-            var largestBlock = _freeBlocks.Count > 0 ? _freeBlocks.Max(b => b.Size) : 0;
+            var totalFreeSpace = _enableFreeSpaceReuse ? _freeBlocks.Sum(b => (long)b.Size) : 0;
+            var largestBlock = _enableFreeSpaceReuse && _freeBlocks.Count > 0 ? _freeBlocks.Max(b => b.Size) : 0;
             var maxBlocks = (_regionSize - FreeSpaceHeader.SIZE) / FreeBlock.SIZE;
 
             return new FreeSpaceStats
             {
-                BlockCount = _freeBlocks.Count,
+                BlockCount = _enableFreeSpaceReuse ? _freeBlocks.Count : 0,
                 MaxBlocks = maxBlocks,
                 TotalFreeSpace = totalFreeSpace,
                 LargestBlock = largestBlock,
                 RegionSize = _regionSize,
-                RegionUtilization = (double)(_freeBlocks.Count * FreeBlock.SIZE + FreeSpaceHeader.SIZE) / _regionSize
+                RegionUtilization = _enableFreeSpaceReuse
+                    ? (double)(_freeBlocks.Count * FreeBlock.SIZE + FreeSpaceHeader.SIZE) / _regionSize
+                    : (double)FreeSpaceHeader.SIZE / _regionSize,
+                IsEnabled = _enableFreeSpaceReuse // 新增字段
             };
-        }
-    }
-
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            SaveFreeSpaceRegion();
-            Marshal.FreeHGlobal((IntPtr)_regionBuffer);
-            _disposed = true;
         }
     }
 
@@ -310,8 +330,19 @@ public unsafe class FreeSpaceManager : IDisposable
             SaveFreeSpaceRegion();
         }
     }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            SaveFreeSpaceRegion();
+            Marshal.FreeHGlobal((IntPtr)_regionBuffer);
+            _disposed = true;
+        }
+    }
 }
 
+// 更新 FreeSpaceStats 结构
 public struct FreeSpaceStats
 {
     public int BlockCount;
@@ -320,12 +351,16 @@ public struct FreeSpaceStats
     public long LargestBlock;
     public int RegionSize;
     public double RegionUtilization;
+    public bool IsEnabled; // 新增：是否启用空闲空间重用
 
     public readonly double FragmentationRatio => BlockCount > 0 ? 1.0 - (double)LargestBlock / (TotalFreeSpace / BlockCount) : 0.0;
     public readonly bool IsFragmented => FragmentationRatio > 0.3;
 
     public override readonly string ToString()
     {
+        if (!IsEnabled)
+            return "Free Space Reuse: Disabled";
+
         return $"Blocks: {BlockCount}/{MaxBlocks}, Free: {TotalFreeSpace / 1024.0:F1}KB, " +
                $"Largest: {LargestBlock / 1024.0:F1}KB, Fragmentation: {FragmentationRatio:P1}";
     }

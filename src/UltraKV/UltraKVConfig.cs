@@ -269,6 +269,14 @@ public class UltraKVConfig
         EncryptionKey = encryptionKey,
     };
 
+    /// <summary>
+    /// 创建调试配置（最严格的验证）
+    /// </summary>
+    public static UltraKVConfig Debug => new()
+    {
+        EnableUpdateValidation = true, // 启用更新验证
+    };
+
     public override string ToString()
     {
         return

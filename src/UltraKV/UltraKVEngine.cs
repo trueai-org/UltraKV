@@ -16,6 +16,7 @@ public unsafe class UltraKVEngine : IDisposable
     private readonly Timer? _flushTimer;
     private bool _disposed;
     private DateTime _lastFlushTime = DateTime.UtcNow;
+    private readonly bool _enableUpdateValidation; // 新增：是否启用更新验证
 
     /// <summary>
     /// 加密数据头部结构
@@ -44,9 +45,10 @@ public unsafe class UltraKVEngine : IDisposable
 
     public UltraKVEngine(string filePath, UltraKVConfig? config = null)
     {
-
-        _config = config ?? UltraKVConfig.Minimal;
+        _config = config ?? UltraKVConfig.Default;
         _config.Validate();
+
+        _enableUpdateValidation = _config.EnableUpdateValidation; // 保存配置
 
         var isNewFile = !File.Exists(filePath);
         _file = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
@@ -70,7 +72,8 @@ public unsafe class UltraKVEngine : IDisposable
             ValidateConfigCompatibility(_config);
         }
 
-        _freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024);
+        // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
+        _freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
         _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
         _keyIndex = new ConcurrentDictionary<string, long>();
 
@@ -86,6 +89,128 @@ public unsafe class UltraKVEngine : IDisposable
                 TimeSpan.FromSeconds(_config.GcFlushInterval),
                 TimeSpan.FromSeconds(_config.GcFlushInterval));
         }
+    }
+
+    /// <summary>
+    /// 验证键的长度
+    /// </summary>
+    private void ValidateKey(string key)
+    {
+        if (string.IsNullOrEmpty(key))
+            throw new ArgumentException("Key cannot be null or empty");
+
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        if (keyBytes.Length > _config.MaxKeyLength)
+            throw new ArgumentException($"Key length ({keyBytes.Length} bytes) exceeds maximum allowed length ({_config.MaxKeyLength} bytes)");
+    }
+
+    /// <summary>
+    /// 验证写入后的数据
+    /// </summary>
+    private void ValidateWrittenData(string key, string expectedValue, long position)
+    {
+        if (!_enableUpdateValidation)
+            return;
+
+        try
+        {
+            // 临时从文件中读取刚写入的数据进行验证
+            var actualValue = ReadValueFromPosition(key, position);
+            if (actualValue != expectedValue)
+            {
+                throw new InvalidDataException($"Update validation failed for key '{key}': expected '{expectedValue}', but read '{actualValue}'");
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidDataException($"Update validation failed for key '{key}': {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// 从指定位置读取数据值（用于验证）
+    /// </summary>
+    private string? ReadValueFromPosition(string key, long position)
+    {
+        var originalPosition = _file.Position; // 保存当前位置
+        try
+        {
+            _file.Seek(position, SeekOrigin.Begin);
+
+            if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
+            {
+                // 加密/压缩模式
+                var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
+                if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
+                    return null;
+
+                fixed (byte* headerPtr = encryptedHeaderBuffer)
+                {
+                    var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
+                    if (encryptedHeader.IsDeleted != 0)
+                        return null;
+
+                    var encryptedData = new byte[encryptedHeader.EncryptedSize];
+                    if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) != encryptedHeader.EncryptedSize)
+                        return null;
+
+                    var processedData = _dataProcessor.UnprocessData(encryptedData);
+                    fixed (byte* dataPtr = processedData)
+                    {
+                        var record = new Record(dataPtr, processedData.Length);
+                        return record.GetValue();
+                    }
+                }
+            }
+            else
+            {
+                // 非加密模式
+                var headerBuffer = new byte[RecordHeader.SIZE];
+                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
+                    return null;
+
+                fixed (byte* headerPtr = headerBuffer)
+                {
+                    var header = *(RecordHeader*)headerPtr;
+                    if (header.IsDeleted != 0)
+                        return null;
+
+                    var totalDataSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
+                    var allData = new byte[totalDataSize];
+
+                    Array.Copy(headerBuffer, allData, RecordHeader.SIZE);
+                    var remainingSize = totalDataSize - RecordHeader.SIZE;
+                    if (remainingSize > 0)
+                    {
+                        _file.Read(allData, RecordHeader.SIZE, remainingSize);
+                    }
+
+                    fixed (byte* dataPtr = allData)
+                    {
+                        var record = new Record(dataPtr, allData.Length);
+                        return record.GetValue();
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _file.Seek(originalPosition, SeekOrigin.Begin); // 恢复原始位置
+        }
+    }
+
+    /// <summary>
+    /// 获取验证统计信息
+    /// </summary>
+    public ValidationStats GetValidationStats()
+    {
+        return new ValidationStats
+        {
+            IsUpdateValidationEnabled = _enableUpdateValidation,
+            MaxKeyLength = _config.MaxKeyLength,
+            IsFreeSpaceReuseEnabled = _config.EnableFreeSpaceReuse,
+            FreeSpaceStats = _freeSpaceManager.GetStats()
+        };
     }
 
     /// <summary>
@@ -131,7 +256,6 @@ public unsafe class UltraKVEngine : IDisposable
             Console.WriteLine($"Flush timer error: {ex.Message}");
         }
     }
-
 
     private void WriteDatabaseHeader()
     {
@@ -185,6 +309,9 @@ public unsafe class UltraKVEngine : IDisposable
         if (string.IsNullOrEmpty(key))
             throw new ArgumentException("Key cannot be null or empty");
 
+        // 验证 key 长度
+        ValidateKey(key);
+
         using var record = new Record(key, value);
         var rawData = record.GetRawData();
 
@@ -215,7 +342,7 @@ public unsafe class UltraKVEngine : IDisposable
                 var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
                 var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
 
-                // 寻找合适的空闲空间
+                // 寻找合适的空闲空间（如果启用了空闲空间重用）
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
                 {
                     position = freeBlock.Position;
@@ -269,6 +396,12 @@ public unsafe class UltraKVEngine : IDisposable
 
             _file.Flush();
             _keyIndex[key] = position;
+
+            // 如果启用了更新验证，验证刚写入的数据
+            if (_enableUpdateValidation)
+            {
+                ValidateWrittenData(key, value, position);
+            }
         }
     }
 
@@ -596,7 +729,7 @@ public unsafe class UltraKVEngine : IDisposable
         {
             // 检查是否满足回收条件
             var stats = GetStats();
-            if (!_databaseHeader.ShouldGC(stats.TotalFileSize, stats.FreeSpaceStats.TotalFreeSpace, stats.ValidRecordCount) 
+            if (!_databaseHeader.ShouldGC(stats.TotalFileSize, stats.FreeSpaceStats.TotalFreeSpace, stats.ValidRecordCount)
                 && !_config.ShouldTriggerGC(stats))
             {
                 return new ShrinkResult
@@ -981,6 +1114,25 @@ public unsafe class UltraKVEngine : IDisposable
             ShouldForceGC = shouldForceGC,
             LastFlushTime = _lastFlushTime
         };
+    }
+
+    /// <summary>
+    /// 验证统计信息
+    /// </summary>
+    public struct ValidationStats
+    {
+        public bool IsUpdateValidationEnabled;
+        public int MaxKeyLength;
+        public bool IsFreeSpaceReuseEnabled;
+        public FreeSpaceStats FreeSpaceStats;
+
+        public override string ToString()
+        {
+            return $"Validation - UpdateValidation: {IsUpdateValidationEnabled}, " +
+                   $"MaxKeyLength: {MaxKeyLength}, " +
+                   $"FreeSpaceReuse: {IsFreeSpaceReuseEnabled}, " +
+                   $"FreeSpace: {(FreeSpaceStats.IsEnabled ? $"{FreeSpaceStats.TotalFreeSpace / 1024.0:F1}KB" : "Disabled")}";
+        }
     }
 
     public void Dispose()
