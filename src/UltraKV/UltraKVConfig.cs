@@ -11,9 +11,29 @@ public class UltraKVConfig
     public bool EnableFreeSpaceReuse { get; set; } = true;
 
     /// <summary>
-    /// 是否开启内存模式，开启内存模式时，读/写将会直接从内存中获取数据，而不是从磁盘读取，数据将全部加载到内存中
+    /// 是否开启内存（Redis）模式，开启内存模式时，读/写将会直接从内存中获取数据，而不是从磁盘读取，数据将全部加载到内存中
     /// </summary>
     public bool EnableMemoryMode { get; set; } = false;
+
+    /// <summary>
+    /// 是否开启更新验证，每次更新完成后校验值是否正确，默认 false，一般开发时使用
+    /// </summary>
+    public bool EnableUpdateValidation { get; set; } = false;
+
+    /// <summary>
+    /// 限制 Key 的最大长度配置
+    /// 默认最大 Key 长度为 4096 字节 
+    /// </summary>
+    public int MaxKeyLength { get; set; } = 4096;
+
+    /// <summary>
+    /// 默认索引页大小，用于分配索引页所在的区域，单位：KB，最小 1KB
+    /// 第一次初始化索引页分配的区域大小
+    /// 当索引页不足时，每次创建一个新的索引分区，使用当前用所有索引页的 2 倍大小，重启或收缩后会合并索引页到第一个索引位置（内存模式不合并）。
+    /// 数据前 128 字节存储数据库信息，后 896 个字节存储索引页信息，供可以存储 62 个索引页。
+    /// 开启内存（Redis）模式时，每个索引页为 1 个分区，固定 62 个分区，索引页是固定大小，例如：4MB、16MB、64MB 等.
+    /// </summary>
+    public int DefaultIndexPageSizeKB { get; set; } = 64;
 
     /// <summary>
     /// 空间重复利用空闲空间存储区域大小（单位：KB），最小为 1K
@@ -108,11 +128,14 @@ public class UltraKVConfig
             EnableFreeSpaceReuse = false;
         }
 
+        if (DefaultIndexPageSizeKB < 1)
+            DefaultIndexPageSizeKB = 1;
+
         if (WriteBufferSizeKB < 4)
-            throw new ArgumentException("WriteBufferSize must be at least 4KB");
+            WriteBufferSizeKB = 4;
 
         if (ReadBufferSizeKB < 4)
-            throw new ArgumentException("ReadBufferSize must be at least 4KB");
+            ReadBufferSizeKB = 4;
 
         // 验证加密配置
         if (EncryptionType != EncryptionType.None)
@@ -133,12 +156,6 @@ public class UltraKVConfig
 
         if (GcFlushInterval < 0)
             GcFlushInterval = 0;
-
-        if (GcFlushInterval < 0)
-            GcFlushInterval = 0;
-
-        if (GcFlushInterval > 65535)
-            GcFlushInterval = 65535; // 最大值为 65535 秒
     }
 
     /// <summary>
@@ -196,6 +213,7 @@ public class UltraKVConfig
     public static UltraKVConfig Minimal => new()
     {
         FreeSpaceRegionSizeKB = 1, // 1KB
+        MaxKeyLength = 64,
         WriteBufferSizeKB = 16, // 16KB
         ReadBufferSizeKB = 16, // 16KB
     };
