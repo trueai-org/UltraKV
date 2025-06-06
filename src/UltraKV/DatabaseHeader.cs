@@ -110,7 +110,7 @@ public struct DatabaseHeader
     }
 
     /// <summary>
-    /// 获取实际的分配倍数
+    /// 获取实际的分配倍数，例如：1.20 = 120%
     /// </summary>
     public readonly double GetActualAllocationMultiplier()
     {
@@ -118,7 +118,7 @@ public struct DatabaseHeader
     }
 
     /// <summary>
-    /// 获取实际的GC空闲空间阈值
+    /// 获取实际的GC空闲空间阈值，例如：0.20 = 20%
     /// </summary>
     public readonly double GetActualGcFreeSpaceThreshold()
     {

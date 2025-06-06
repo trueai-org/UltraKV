@@ -62,13 +62,11 @@ namespace UltraKV
                 {
                     engine2.Put($"warmup_{i}", $"value_{bigValue}{i}");
                     var x1 = engine2.Get($"warmup_{i}"); // 预热读取
-
                 }
                 engine2.Flush();
 
                 Console.WriteLine($"Compressed Engine Stats after warmup: {engine1.GetStats()}");
                 Console.WriteLine($"Uncompressed Engine Stats after warmup: {engine2.GetStats()}");
-
 
                 // 压缩测试
                 Console.WriteLine("\n=== Write Performance (Compressed) ===");
@@ -109,13 +107,9 @@ namespace UltraKV
                 Console.WriteLine($"Uncompressed Write Performance: {writeOpsPerSecUncompressed:N0} ops/sec");
                 Console.WriteLine($"After Uncompressed Write - {engine2.GetStats()}");
 
-
-
-
                 //=================================
 
                 var engine = manager.GetEngine("benchmark");
-
 
                 // 预热
                 Console.WriteLine("Warming up...");
@@ -125,7 +119,6 @@ namespace UltraKV
                 }
 
                 Console.WriteLine("\n=== Write Performance ===");
-
 
                 for (int i = 0; i < ITERATIONS; i++)
                 {
@@ -166,7 +159,6 @@ namespace UltraKV
                 var updateOpsPerSec1 = WARM_UP * 1000.0 / sw.ElapsedMilliseconds;
                 Console.WriteLine($"Update {WARM_UP:N0} existing keys: {sw.ElapsedMilliseconds}ms");
                 Console.WriteLine($"Update Performance: {updateOpsPerSec1:N0} ops/sec");
-
 
                 Console.WriteLine("\n=== Read Performance ===");
                 sw.Restart();

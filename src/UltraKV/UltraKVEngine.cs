@@ -11,8 +11,11 @@ public unsafe class UltraKVEngine : IDisposable
     private readonly DataProcessor _dataProcessor;
     private readonly ConcurrentDictionary<string, long> _keyIndex;
     private readonly DatabaseHeader _databaseHeader;
+    private readonly UltraKVConfig _config;
     private readonly object _writeLock = new object();
+    private readonly Timer? _flushTimer;
     private bool _disposed;
+    private DateTime _lastFlushTime = DateTime.UtcNow;
 
     /// <summary>
     /// 加密数据头部结构
@@ -41,8 +44,9 @@ public unsafe class UltraKVEngine : IDisposable
 
     public UltraKVEngine(string filePath, UltraKVConfig? config = null)
     {
-        config ??= UltraKVConfig.Minimal;
-        config.Validate();
+
+        _config = config ?? UltraKVConfig.Minimal;
+        _config.Validate();
 
         var isNewFile = !File.Exists(filePath);
         _file = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
@@ -50,7 +54,7 @@ public unsafe class UltraKVEngine : IDisposable
         if (isNewFile)
         {
             // 新建数据库
-            _databaseHeader = DatabaseHeader.Create(config);
+            _databaseHeader = DatabaseHeader.Create(_config);
             WriteDatabaseHeader();
         }
         else
@@ -63,18 +67,71 @@ public unsafe class UltraKVEngine : IDisposable
             }
 
             // 验证配置兼容性
-            ValidateConfigCompatibility(config);
+            ValidateConfigCompatibility(_config);
         }
 
         _freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024);
-        _dataProcessor = new DataProcessor(_databaseHeader, config.EncryptionKey);
+        _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
         _keyIndex = new ConcurrentDictionary<string, long>();
 
         if (!isNewFile)
         {
             LoadIndex();
         }
+
+        // 启动定时刷盘器
+        if (_config.GcFlushInterval > 0)
+        {
+            _flushTimer = new Timer(OnFlushTimer, null,
+                TimeSpan.FromSeconds(_config.GcFlushInterval),
+                TimeSpan.FromSeconds(_config.GcFlushInterval));
+        }
     }
+
+    /// <summary>
+    /// 定时刷盘回调
+    /// </summary>
+    private void OnFlushTimer(object? state)
+    {
+        try
+        {
+            if (_disposed) return;
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastFlushTime).TotalSeconds >= _config.GcFlushInterval)
+            {
+                Flush();
+                _lastFlushTime = now;
+
+                // 如果启用了自动回收，检查是否需要GC
+                if (_databaseHeader.IsGcAutoRecycleEnabled)
+                {
+                    var stats = GetStats();
+                    if (_databaseHeader.ShouldGC(stats.TotalFileSize, stats.FreeSpaceStats.TotalFreeSpace, stats.ValidRecordCount))
+                    {
+                        // 在后台线程执行GC，避免阻塞
+                        Task.Run(() =>
+                        {
+                            try
+                            {
+                                var result = Shrink();
+                                Console.WriteLine($"Auto GC completed: {result}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Auto GC failed: {ex.Message}");
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Flush timer error: {ex.Message}");
+        }
+    }
+
 
     private void WriteDatabaseHeader()
     {
@@ -529,9 +586,39 @@ public unsafe class UltraKVEngine : IDisposable
     }
 
     /// <summary>
+    /// 强制回收，允许强制重建
+    /// </summary>
+    /// <param name="force">是否强制回收，无论条件是否满足</param>
+    /// <returns>回收结果</returns>
+    public ShrinkResult Shrink(bool force = false)
+    {
+        if (!force)
+        {
+            // 检查是否满足回收条件
+            var stats = GetStats();
+            if (!_databaseHeader.ShouldGC(stats.TotalFileSize, stats.FreeSpaceStats.TotalFreeSpace, stats.ValidRecordCount) 
+                && !_config.ShouldTriggerGC(stats))
+            {
+                return new ShrinkResult
+                {
+                    OriginalFileSize = _file.Length,
+                    NewFileSize = _file.Length,
+                    SpaceSaved = 0,
+                    SpaceSavedPercentage = 0,
+                    ValidRecords = _keyIndex.Count,
+                    TotalRecordsProcessed = _keyIndex.Count,
+                    ElapsedMilliseconds = 0
+                };
+            }
+        }
+
+        return PerformShrink();
+    }
+
+    /// <summary>
     /// 收缩文件，移除碎片化空间，支持加密和非加密格式
     /// </summary>
-    public ShrinkResult Shrink()
+    public ShrinkResult PerformShrink()
     {
         lock (_writeLock)
         {
@@ -870,10 +957,46 @@ public unsafe class UltraKVEngine : IDisposable
         };
     }
 
+    /// <summary>
+    /// 获取GC统计信息
+    /// </summary>
+    public GCStats GetGCStats()
+    {
+        var stats = GetStats();
+        var shouldTriggerGC = _databaseHeader.ShouldGC(stats.TotalFileSize, stats.FreeSpaceStats.TotalFreeSpace, stats.ValidRecordCount);
+        var shouldForceGC = _config.ShouldTriggerGC(stats);
+
+        return new GCStats
+        {
+            IsGcAutoRecycleEnabled = _databaseHeader.IsGcAutoRecycleEnabled,
+            GcMinFileSizeKB = _databaseHeader.GcMinFileSizeKB,
+            GcFreeSpaceThreshold = _databaseHeader.GcFreeSpaceThreshold,
+            GcMinRecordCount = _databaseHeader.GcMinRecordCount,
+            GcFlushInterval = _config.GcFlushInterval,
+            CurrentFileSize = stats.TotalFileSize,
+            CurrentFreeSpace = stats.WastedSpace,
+            CurrentFreeSpaceRatio = stats.TotalFileSize > 0 ? (double)stats.WastedSpace / stats.TotalFileSize : 0.0,
+            CurrentRecordCount = stats.ValidRecordCount,
+            ShouldTriggerGC = shouldTriggerGC,
+            ShouldForceGC = shouldForceGC,
+            LastFlushTime = _lastFlushTime
+        };
+    }
+
     public void Dispose()
     {
         if (!_disposed)
         {
+            _flushTimer?.Dispose();
+
+            // 最后一次刷盘
+            try
+            {
+                Flush();
+            }
+            catch { }
+
+            // 更新最后访问时间
             var updatedHeader = _databaseHeader;
             updatedHeader.UpdateAccessTime();
 
@@ -886,6 +1009,34 @@ public unsafe class UltraKVEngine : IDisposable
             _file?.Dispose();
             _disposed = true;
         }
+    }
+}
+
+/// <summary>
+/// GC统计信息
+/// </summary>
+public struct GCStats
+{
+    public bool IsGcAutoRecycleEnabled;
+    public long GcMinFileSizeKB;
+    public double GcFreeSpaceThreshold;
+    public int GcMinRecordCount;
+    public int GcFlushInterval;
+    public long CurrentFileSize;
+    public long CurrentFreeSpace;
+    public double CurrentFreeSpaceRatio;
+    public int CurrentRecordCount;
+    public bool ShouldTriggerGC;
+    public bool ShouldForceGC;
+    public DateTime LastFlushTime;
+
+    public override string ToString()
+    {
+        return $"GC Stats - AutoRecycle: {IsGcAutoRecycleEnabled}, " +
+               $"Current: {CurrentFileSize / 1024}KB ({CurrentFreeSpaceRatio:P1} free), " +
+               $"Records: {CurrentRecordCount}, " +
+               $"ShouldGC: {ShouldTriggerGC}, ForceGC: {ShouldForceGC}, " +
+               $"LastFlush: {LastFlushTime:HH:mm:ss}";
     }
 }
 
