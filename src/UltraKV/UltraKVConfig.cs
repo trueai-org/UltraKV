@@ -6,9 +6,10 @@
 public class UltraKVConfig
 {
     /// <summary>
-    /// 空闲空间存储区域大小（字节），默认 4KB
+    /// 空闲空间存储区域大小（字节），默认 n * 12 = 3840 字节
+    /// 每个空闲空间区域占用 12 字节，默认 320 个区域，总计 3840 字节
     /// </summary>
-    public int FreeSpaceRegionSize { get; set; } = 4 * 1024;
+    public int FreeSpaceRegionSize { get; set; } = GetFreeSpaceRegionSize(320); // 320 regions * 12 bytes each = 3840 bytes
 
     /// <summary>
     /// 原地更新时的空间分配倍数，默认 1.2 倍
@@ -40,6 +41,7 @@ public class UltraKVConfig
     /// </summary>
     public int ReadBufferSize { get; set; } = 64 * 1024;
 
+
     /// <summary>
     /// 验证配置有效性
     /// </summary>
@@ -69,6 +71,16 @@ public class UltraKVConfig
     }
 
     /// <summary>
+    /// 传入一个区域数量，返回字节大小
+    /// </summary>
+    /// <param name="regionCount"></param>
+    /// <returns></returns>
+    public static int GetFreeSpaceRegionSize(int regionCount)
+    {
+        return regionCount * FreeBlock.SIZE; // 每个区域占用 12 字节
+    }
+
+    /// <summary>
     /// 创建默认配置
     /// </summary>
     public static UltraKVConfig Default => new();
@@ -78,12 +90,9 @@ public class UltraKVConfig
     /// </summary>
     public static UltraKVConfig Minimal => new()
     {
-        FreeSpaceRegionSize = 1 * 1024, // 1KB
-        AllocationMultiplier = 1.0,
-        CompressionType = CompressionType.None,
-        EncryptionType = EncryptionType.None,
-        WriteBufferSize = 4 * 1024, // 4KB
-        ReadBufferSize = 4 * 1024 // 4KB
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(80), // 960 bytes (80 regions)
+        WriteBufferSize = 16 * 1024, // 16KB
+        ReadBufferSize = 16 * 1024 // 16KB
     };
 
     /// <summary>
@@ -91,12 +100,27 @@ public class UltraKVConfig
     /// </summary>
     public static UltraKVConfig HighPerformance => new()
     {
-        FreeSpaceRegionSize = 16 * 1024,
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
         AllocationMultiplier = 1.5,
-        CompressionType = CompressionType.None,
-        EncryptionType = EncryptionType.None,
-        WriteBufferSize = 256 * 1024,
-        ReadBufferSize = 256 * 1024
+        WriteBufferSize = 1024 * 1024,
+        ReadBufferSize = 1024 * 1024
+    };
+
+    /// <summary>
+    /// SSD 优化配置
+    /// </summary>
+    public static UltraKVConfig SSDOptimized => new()
+    {
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
+        AllocationMultiplier = 1.5,
+        WriteBufferSize = 256 * 1024, // 256KB
+        ReadBufferSize = 256 * 1024, // 256KB
+    };
+
+    // HDD 优化配置
+    public static UltraKVConfig HDDOptimized => new()
+    {
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(1280), // 15360 bytes (1280 regions)
     };
 
     /// <summary>
@@ -104,12 +128,9 @@ public class UltraKVConfig
     /// </summary>
     public static UltraKVConfig SpaceOptimized => new()
     {
-        FreeSpaceRegionSize = 8 * 1024,
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(640), // 7680 bytes (640 regions)
         AllocationMultiplier = 1.1,
         CompressionType = CompressionType.Gzip,
-        EncryptionType = EncryptionType.None,
-        WriteBufferSize = 32 * 1024,
-        ReadBufferSize = 32 * 1024
     };
 
     /// <summary>
@@ -117,22 +138,20 @@ public class UltraKVConfig
     /// </summary>
     public static UltraKVConfig Secure(string encryptionKey) => new()
     {
-        FreeSpaceRegionSize = 8 * 1024,
-        AllocationMultiplier = 1.2,
+        FreeSpaceRegionSize = GetFreeSpaceRegionSize(640), // 7680 bytes (640 regions)
         CompressionType = CompressionType.Gzip,
         EncryptionType = EncryptionType.AES256GCM,
-        EncryptionKey = encryptionKey,
-        WriteBufferSize = 64 * 1024,
-        ReadBufferSize = 64 * 1024
+        EncryptionKey = encryptionKey
     };
 
     public override string ToString()
     {
         return $"FreeSpace: {FreeSpaceRegionSize / 1024}KB, " +
-               $"Multiplier: {AllocationMultiplier:F1}x, " +
-               $"Compression: {CompressionType}, " +
-               $"Encryption: {EncryptionType}, " +
-               $"WriteBuffer: {WriteBufferSize / 1024}KB, " +
-               $"ReadBuffer: {ReadBufferSize / 1024}KB";
+            $"FreeSpaceRegions: {FreeSpaceRegionSize / FreeBlock.SIZE}, " +
+            $"Multiplier: {AllocationMultiplier:F1}x, " +
+            $"Compression: {CompressionType}, " +
+            $"Encryption: {EncryptionType}, " +
+            $"WriteBuffer: {WriteBufferSize / 1024}KB, " +
+            $"ReadBuffer: {ReadBufferSize / 1024}KB";
     }
 }
