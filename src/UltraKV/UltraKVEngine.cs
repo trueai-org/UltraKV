@@ -66,7 +66,7 @@ public unsafe class UltraKVEngine : IDisposable
             ValidateConfigCompatibility(config);
         }
 
-        _freeSpaceManager = new FreeSpaceManager(_file, (int)_databaseHeader.FreeSpaceRegionSize);
+        _freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024);
         _dataProcessor = new DataProcessor(_databaseHeader, config.EncryptionKey);
         _keyIndex = new ConcurrentDictionary<string, long>();
 
@@ -156,7 +156,7 @@ public unsafe class UltraKVEngine : IDisposable
                 };
 
                 var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
-                var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 10));
+                var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
 
                 // 寻找合适的空闲空间
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
@@ -188,7 +188,7 @@ public unsafe class UltraKVEngine : IDisposable
             {
                 // 非加密模式：使用原有格式
                 var requiredSize = rawData.Length;
-                var multipliedSize = (int)(requiredSize * (1 + _databaseHeader.AllocationMultiplier / 10));
+                var multipliedSize = (int)(requiredSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
 
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
                 {
@@ -558,7 +558,7 @@ public unsafe class UltraKVEngine : IDisposable
                 tempFile.Write(headerBytes, 0, DatabaseHeader.SIZE);
 
                 // 创建临时空闲空间管理器
-                using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, (int)_databaseHeader.FreeSpaceRegionSize);
+                using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, _databaseHeader.FreeSpaceRegionSizeKB * 1024);
 
                 var newKeyIndex = new ConcurrentDictionary<string, long>();
                 var currentPosition = tempFreeSpaceManager.GetDataStartPosition();

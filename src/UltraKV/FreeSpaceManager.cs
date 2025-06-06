@@ -9,12 +9,12 @@ namespace UltraKV;
 public struct FreeBlock
 {
     public long Position;           // 8 bytes - 文件位置
-    public int Size;               // 4 bytes - 块大小
-                                   // Total: 12 bytes
+    public long Size;               // 8 bytes - 块大小
+                                   // Total: 16 bytes
 
-    public const int SIZE = 12;
+    public const int SIZE = 16;
 
-    public FreeBlock(long position, int size)
+    public FreeBlock(long position, long size)
     {
         Position = position;
         Size = size;
@@ -29,7 +29,7 @@ public struct FreeBlock
     {
         var startPos = Math.Min(Position, other.Position);
         var endPos = Math.Max(Position + Size, other.Position + other.Size);
-        return new FreeBlock(startPos, (int)(endPos - startPos));
+        return new FreeBlock(startPos, (endPos - startPos));
     }
 
     public override string ToString()
@@ -46,11 +46,11 @@ internal struct FreeSpaceHeader
 {
     public uint Magic;              // 4 bytes - 魔法数字
     public int BlockCount;          // 4 bytes - 空闲块数量
-    public int RegionSize;          // 4 bytes - 区域大小
-                                    // Total: 12 bytes
+    public long RegionSize;          // 8 bytes - 区域大小
+                                    // Total: 16 bytes
 
     public const uint MAGIC_NUMBER = 0x46535053; // "FSPS" - Free Space
-    public const int SIZE = 12;
+    public const int SIZE = 16;
 
     public bool IsValid => Magic == MAGIC_NUMBER && BlockCount >= 0 && RegionSize > 0;
 }
@@ -78,7 +78,7 @@ public unsafe class FreeSpaceManager : IDisposable
         LoadFreeSpaceRegion();
     }
 
-    public void AddFreeSpace(long position, int size)
+    public void AddFreeSpace(long position, long size)
     {
         if (position < GetDataStartPosition() || size <= 0)
             return;
@@ -97,6 +97,7 @@ public unsafe class FreeSpaceManager : IDisposable
                 }
             }
 
+
             // 合并所有相邻块
             var mergedBlock = newBlock;
             for (int i = toMerge.Count - 1; i >= 0; i--)
@@ -110,6 +111,7 @@ public unsafe class FreeSpaceManager : IDisposable
             _freeBlocks.Sort((a, b) => a.Size.CompareTo(b.Size));
 
             EnsureSpaceCapacity();
+
             _isDirty = true;
         }
     }
@@ -315,7 +317,7 @@ public struct FreeSpaceStats
     public int BlockCount;
     public int MaxBlocks;
     public long TotalFreeSpace;
-    public int LargestBlock;
+    public long LargestBlock;
     public int RegionSize;
     public double RegionUtilization;
 

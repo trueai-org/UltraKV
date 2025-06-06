@@ -5,6 +5,7 @@ UltraKV is a high-performance key-value store designed for fast data retrieval a
 ## Features
 
 - High-performance key-value storage
+- max value length = int.MaxValue = ~2.1 GB
 
 ## Testing
 

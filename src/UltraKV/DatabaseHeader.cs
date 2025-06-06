@@ -3,7 +3,7 @@
 namespace UltraKV;
 
 /// <summary>
-/// 数据库文件头结构（存储数据库级别的配置信息）- 固定64字节
+/// 数据库文件头结构（存储数据库级别的配置信息）- 固定 100 字节
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct DatabaseHeader
@@ -12,9 +12,9 @@ public struct DatabaseHeader
     public ushort Version;                  // 2 bytes - 版本号
     public CompressionType CompressionType; // 1 byte - 压缩类型
     public EncryptionType EncryptionType;   // 1 byte - 加密类型
-    public uint FreeSpaceRegionSize;        // 4 bytes - 空闲空间区域大小
-    public byte AllocationMultiplier;       // 1 byte - 预分配空间倍数百分比，实际倍数算法：1 + n/100
-    public byte GcFreeSpaceThreshold;       // 1 byte - GC空闲空间阈值百分比，实际阈值：n/100
+    public int FreeSpaceRegionSizeKB;       // 4 bytes - 空闲空间区域大小
+    public byte AllocationMultiplier;       // 1 byte - 预分配空间倍数百分比，实际倍数算法：1 + n/100.0
+    public byte GcFreeSpaceThreshold;       // 1 byte - GC空闲空间阈值百分比，实际阈值：n/100.0
     public ushort GcMinRecordCount;         // 2 bytes - GC最小记录数要求
     public uint WriteBufferSizeKB;          // 4 bytes - 写缓冲区大小（KB）
     public uint ReadBufferSizeKB;           // 4 bytes - 读缓冲区大小（KB）
@@ -22,16 +22,27 @@ public struct DatabaseHeader
     public ushort GcFlushInterval;          // 2 bytes - GC刷盘间隔（秒）
     public byte GcAutoRecycleEnabled;       // 1 byte - 是否开启自动GC
     public byte EnableFreeSpaceReuse;       // 1 byte - 是否启用空间重复利用
+    public byte EnableMemoryMode;           // 1 byte - 是否开启内存模式
     public long CreatedTime;                // 8 bytes - 创建时间
     public long LastAccessTime;             // 8 bytes - 最后访问时间
     public long LastGcTime;                 // 8 bytes - 最后GC时间
     public uint TotalGcCount;               // 4 bytes - 总GC次数
+    // total 61 byte
+
+    // 保留字节 - 使用多个字段组合 100-61-4 = 35 bytes
+    public byte Reserved6;                  // 1 byte
+    public ushort Reserved5;                // 2 bytes
+    public long Reserved4;                  // 8 bytes
+    public long Reserved3;                  // 8 bytes
+    public long Reserved2;                  // 8 bytes
+    public long Reserved1;                  // 8 bytes
+
+    // 校验和字段
     public uint Checksum;                   // 4 bytes - 校验和
-                                            // Total: 64 bytes
 
     public const uint MAGIC_NUMBER = 0x554B5644; // "UKVD" - UltraKV Database
     public const ushort CURRENT_VERSION = 1;
-    public const int SIZE = 64;
+    public const int SIZE = 100;
 
     public static DatabaseHeader Create(UltraKVConfig config)
     {
@@ -41,7 +52,7 @@ public struct DatabaseHeader
             Version = CURRENT_VERSION,
             CompressionType = config.CompressionType,
             EncryptionType = config.EncryptionType,
-            FreeSpaceRegionSize = config.FreeSpaceRegionSize,
+            FreeSpaceRegionSizeKB = config.FreeSpaceRegionSizeKB,
             AllocationMultiplier = config.AllocationMultiplier,
             GcFreeSpaceThreshold = config.GcFreeSpaceThreshold,
             GcMinRecordCount = Math.Min(config.GcMinRecordCount, ushort.MaxValue),
@@ -51,10 +62,17 @@ public struct DatabaseHeader
             GcFlushInterval = Math.Min(config.GcFlushInterval, ushort.MaxValue),
             GcAutoRecycleEnabled = config.GcAutoRecycleEnabled ? (byte)1 : (byte)0,
             EnableFreeSpaceReuse = config.EnableFreeSpaceReuse ? (byte)1 : (byte)0,
+            EnableMemoryMode = config.EnableMemoryMode ? (byte)1 : (byte)0,
             CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             LastAccessTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             LastGcTime = 0,
-            TotalGcCount = 0
+            TotalGcCount = 0,
+            Reserved1 = 0,
+            Reserved2 = 0,
+            Reserved3 = 0,
+            Reserved4 = 0,
+            Reserved5 = 0,
+            Reserved6 = 0
         };
 
         header.Checksum = CalculateChecksum(header);
@@ -165,12 +183,14 @@ public struct DatabaseHeader
     {
         return $"Magic: 0x{Magic:X8}, Version: {Version}, " +
                $"Compression: {CompressionType}, Encryption: {EncryptionType}, " +
-               $"FreeSpaceRegion: {FreeSpaceRegionSize}B, " +
+               $"EnableMemoryMode: {EnableMemoryMode}, " +
+               $"EnableFreeSpaceReuse: {EnableFreeSpaceReuse}, " +
+               $"FreeSpaceRegion: {FreeSpaceRegionSizeKB}KB, " +
                $"AllocationMultiplier: {GetActualAllocationMultiplier():F1}x, " +
                $"GcThreshold: {GetActualGcFreeSpaceThreshold():P1}, " +
                $"GcMinRecords: {GcMinRecordCount}, " +
-               $"GcMinFileSize: {GetActualGcMinFileSize() / 1024}KB, " +
-               $"GcFlushInterval: {GetActualGcFlushInterval()}ms, " +
+               $"GcMinFileSize: {GcMinFileSizeKB}KB, " +
+               $"GcFlushInterval: {GcFlushInterval}s, " +
                $"AutoGC: {IsGcAutoRecycleEnabled}, " +
                $"FreeSpaceReuse: {IsFreeSpaceReuseEnabled}, " +
                $"GcCount: {TotalGcCount}, " +
