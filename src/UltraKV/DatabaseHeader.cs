@@ -13,7 +13,7 @@ public struct DatabaseHeader
     public CompressionType CompressionType; // 1 byte - 压缩类型
     public EncryptionType EncryptionType;   // 1 byte - 加密类型
     public uint FreeSpaceRegionSize;        // 4 bytes - 空闲空间区域大小
-    public double AllocationMultiplier;     // 8 bytes - 分配倍数
+    public byte AllocationMultiplier;       // 1 bytes - 预分配空间倍数，实际倍数算法：1 + n/10
     public uint WriteBufferSize;            // 4 bytes - 写缓冲区大小
     public uint ReadBufferSize;             // 4 bytes - 读缓冲区大小
     public long CreatedTime;                // 8 bytes - 创建时间

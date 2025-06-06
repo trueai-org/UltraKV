@@ -24,9 +24,15 @@ public class UltraKVConfig
     public int FreeSpaceRegionSize { get; set; } = GetFreeSpaceRegionSize(320); // 320 regions * 12 bytes each = 3840 bytes
 
     /// <summary>
-    /// 原地更新时的空间分配倍数，默认 1.2 倍
+    /// 原地更新时的空间分配倍数（百分比/10，0~255），默认 2，即 1.2 倍，配置规则为：1+n/10
+    /// 例如：
+    /// 最小值为 0
+    /// 配置值为 2，则分配倍数为 1 + 2/10 = 1.2
+    /// 配置值为 10，则分配倍数为 1 + 10/10 = 2.0
+    /// 配置值为 20，则分配倍数为 1 + 20/10 = 3.0
+    /// 最大值为 255，则分配倍数为 1 + 255/10 = 26.5
     /// </summary>
-    public double AllocationMultiplier { get; set; } = 1.2;
+    public byte AllocationMultiplier { get; set; } = 2;
 
     /// <summary>
     /// 压缩算法类型（数据库级别，创建后不可变更）
@@ -62,10 +68,10 @@ public class UltraKVConfig
     public long GcMinFileSize { get; set; } = 1024 * 1024; // 1MB
 
     /// <summary>
-    /// GC 累计空闲空间百分比阈值，默认 20%
+    /// GC 累计空闲空间百分比阈值（百分比/10，0~255），默认 2，即：n/10 = 20%
     /// 当累计空闲空间占总文件大小的百分比超过此值时触发GC
     /// </summary>
-    public double GcFreeSpaceThreshold { get; set; } = 0.20; // 20%
+    public byte GcFreeSpaceThreshold { get; set; } = 2; // 20%
 
     /// <summary>
     /// GC 最小数据条数要求，默认 100 条
@@ -93,8 +99,8 @@ public class UltraKVConfig
         if (FreeSpaceRegionSize < 1024)
             throw new ArgumentException("FreeSpaceRegionSize must be at least 1KB");
 
-        if (AllocationMultiplier < 1.0 || AllocationMultiplier > 100.0)
-            throw new ArgumentException("AllocationMultiplier must be between 1.0 and 100.0");
+        if (AllocationMultiplier < 0 || AllocationMultiplier > 255)
+            throw new ArgumentException("AllocationMultiplier must be between 0 and 255");
 
         if (WriteBufferSize < 4096)
             throw new ArgumentException("WriteBufferSize must be at least 4KB");
@@ -149,7 +155,7 @@ public class UltraKVConfig
             ? (double)stats.WastedSpace / stats.TotalFileSize
             : 0.0;
 
-        return freeSpaceRatio >= GcFreeSpaceThreshold;
+        return freeSpaceRatio >= GcFreeSpaceThreshold / 10;
     }
 
     /// <summary>
@@ -183,7 +189,7 @@ public class UltraKVConfig
     public static UltraKVConfig HighPerformance => new()
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
-        AllocationMultiplier = 1.5,
+        AllocationMultiplier = 5,
         WriteBufferSize = 1024 * 1024,
         ReadBufferSize = 1024 * 1024,
     };
@@ -194,7 +200,7 @@ public class UltraKVConfig
     public static UltraKVConfig SSDOptimized => new()
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
-        AllocationMultiplier = 1.5,
+        AllocationMultiplier = 5,
         WriteBufferSize = 256 * 1024, // 256KB
         ReadBufferSize = 256 * 1024, // 256KB
     };
@@ -213,7 +219,7 @@ public class UltraKVConfig
     public static UltraKVConfig SpaceOptimized => new()
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(640), // 7680 bytes (640 regions)
-        AllocationMultiplier = 1.1,
+        AllocationMultiplier = 1,
         CompressionType = CompressionType.Gzip,
     };
 
@@ -233,13 +239,13 @@ public class UltraKVConfig
         return $"EnableFreeSpaceReuse: {EnableFreeSpaceReuse}, " +
             $"FreeSpace: {FreeSpaceRegionSize / 1024}KB, " +
             $"FreeSpaceRegions: {FreeSpaceRegionSize / FreeBlock.SIZE}, " +
-            $"Multiplier: {AllocationMultiplier:F1}x, " +
+            $"Multiplier: {1 + AllocationMultiplier / 10:F1}x, " +
             $"Compression: {CompressionType}, " +
             $"Encryption: {EncryptionType}, " +
             $"WriteBuffer: {WriteBufferSize / 1024}KB, " +
             $"ReadBuffer: {ReadBufferSize / 1024}KB, " +
             $"GC: MinFile={GcMinFileSize / 1024}KB, " +
-            $"FreeThreshold={GcFreeSpaceThreshold:P1}, " +
+            $"FreeThreshold={GcFreeSpaceThreshold / 10:P1}, " +
             $"MinRecords={GcMinRecordCount}, " +
             $"AutoRecycle={GcAutoRecycleEnabled}, " +
             $"FlushInterval={GcFlushIntervalMs}ms";

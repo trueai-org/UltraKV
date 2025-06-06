@@ -156,7 +156,7 @@ public unsafe class UltraKVEngine : IDisposable
                 };
 
                 var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
-                var multipliedSize = (int)(totalSize * _databaseHeader.AllocationMultiplier);
+                var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 10));
 
                 // 寻找合适的空闲空间
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
@@ -188,7 +188,7 @@ public unsafe class UltraKVEngine : IDisposable
             {
                 // 非加密模式：使用原有格式
                 var requiredSize = rawData.Length;
-                var multipliedSize = (int)(requiredSize * _databaseHeader.AllocationMultiplier);
+                var multipliedSize = (int)(requiredSize * (1 + _databaseHeader.AllocationMultiplier / 10));
 
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
                 {
