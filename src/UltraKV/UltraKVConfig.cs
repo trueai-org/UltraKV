@@ -11,8 +11,15 @@ public class UltraKVConfig
     public bool EnableFreeSpaceReuse { get; set; } = true;
 
     /// <summary>
-    /// 空闲空间存储区域大小（字节），默认 n * 12 = 3840 字节
-    /// 每个空闲空间区域占用 12 字节，默认 320 个区域，总计 3840 字节
+    /// 空间重复利用空闲空间存储区域大小（字节），默认 320 个区域，总计 3840 字节
+    /// 每个空闲空间区域占用 12 字节
+    /// 推荐配置规则：未来数据总量以及更新/删除频率预估，建议最高不超过10万个区域，对于高频读写/删除的场景，建议使用偏大的区域数。
+    /// 参考示例：
+    /// 100 ~ 1000 条，80 个区域（960B）
+    /// 1000 ~ 10000 条，320 个区域（3.84K）
+    /// 10000 ~ 100000 条，3000 个区域（3.84M）
+    /// 100000 ~ 1000000 条，32000 个区域（38.4M）
+    /// 超过 1000000 条时，建议使用更大的区域数，例如 64000 或 128000 个区域（76.8M 或 153.6M）
     /// </summary>
     public int FreeSpaceRegionSize { get; set; } = GetFreeSpaceRegionSize(320); // 320 regions * 12 bytes each = 3840 bytes
 
@@ -123,6 +130,29 @@ public class UltraKVConfig
     }
 
     /// <summary>
+    /// 检查是否应该触发GC
+    /// </summary>
+    /// <param name="stats">数据库统计信息</param>
+    /// <returns>是否应该触发GC</returns>
+    public bool ShouldTriggerGC(DatabaseStats stats)
+    {
+        // 检查最小文件大小要求
+        if (stats.TotalFileSize < GcMinFileSize)
+            return false;
+
+        // 检查最小记录数要求
+        if (stats.ValidRecordCount < GcMinRecordCount)
+            return false;
+
+        // 检查空闲空间百分比
+        var freeSpaceRatio = stats.TotalFileSize > 0
+            ? (double)stats.WastedSpace / stats.TotalFileSize
+            : 0.0;
+
+        return freeSpaceRatio >= GcFreeSpaceThreshold;
+    }
+
+    /// <summary>
     /// 传入一个区域数量，返回字节大小
     /// </summary>
     /// <param name="regionCount"></param>
@@ -200,7 +230,8 @@ public class UltraKVConfig
 
     public override string ToString()
     {
-        return $"FreeSpace: {FreeSpaceRegionSize / 1024}KB, " +
+        return $"EnableFreeSpaceReuse: {EnableFreeSpaceReuse}, " +
+            $"FreeSpace: {FreeSpaceRegionSize / 1024}KB, " +
             $"FreeSpaceRegions: {FreeSpaceRegionSize / FreeBlock.SIZE}, " +
             $"Multiplier: {AllocationMultiplier:F1}x, " +
             $"Compression: {CompressionType}, " +
