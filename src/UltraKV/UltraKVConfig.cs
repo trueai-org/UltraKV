@@ -6,6 +6,11 @@
 public class UltraKVConfig
 {
     /// <summary>
+    /// 启用空间重复利用功能
+    /// </summary>
+    public bool EnableFreeSpaceReuse { get; set; } = true;
+
+    /// <summary>
     /// 空闲空间存储区域大小（字节），默认 n * 12 = 3840 字节
     /// 每个空闲空间区域占用 12 字节，默认 320 个区域，总计 3840 字节
     /// </summary>
@@ -41,6 +46,37 @@ public class UltraKVConfig
     /// </summary>
     public int ReadBufferSize { get; set; } = 64 * 1024;
 
+    // ==================== GC 配置项 ====================
+
+    /// <summary>
+    /// GC 最小文件大小要求（字节），默认 1MB
+    /// 只有当文件大小超过此值时才会触发GC
+    /// </summary>
+    public long GcMinFileSize { get; set; } = 1024 * 1024; // 1MB
+
+    /// <summary>
+    /// GC 累计空闲空间百分比阈值，默认 20%
+    /// 当累计空闲空间占总文件大小的百分比超过此值时触发GC
+    /// </summary>
+    public double GcFreeSpaceThreshold { get; set; } = 0.20; // 20%
+
+    /// <summary>
+    /// GC 最小数据条数要求，默认 100 条
+    /// 只有当数据条数超过此值时才会触发GC
+    /// </summary>
+    public int GcMinRecordCount { get; set; } = 100;
+
+    /// <summary>
+    /// 是否开启空闲时自动回收，默认 false
+    /// 当设置为 true 时，系统会在空闲时自动触发GC
+    /// </summary>
+    public bool GcAutoRecycleEnabled { get; set; } = false;
+
+    /// <summary>
+    /// 定期刷磁盘时间间隔（毫秒），默认 5 秒，最少 100ms，为 0 时表示不刷盘
+    /// 控制数据刷新到磁盘的频率
+    /// </summary>
+    public int GcFlushIntervalMs { get; set; } = 5000; // 5 seconds
 
     /// <summary>
     /// 验证配置有效性
@@ -68,6 +104,22 @@ public class UltraKVConfig
             if (EncryptionKey.Length < 16)
                 throw new ArgumentException("EncryptionKey must be at least 16 characters");
         }
+
+        // 验证GC配置
+        if (GcMinFileSize < 0)
+            GcMinFileSize = 0;
+
+        if (GcFreeSpaceThreshold < 0.0)
+            GcFreeSpaceThreshold = 0;
+
+        if (GcMinRecordCount < 0)
+            GcMinRecordCount = 0;
+
+        if (GcFlushIntervalMs < 0)
+            GcFlushIntervalMs = 0;
+
+        if (GcFlushIntervalMs > 0 && GcFlushIntervalMs < 100)
+            GcFlushIntervalMs = 100;
     }
 
     /// <summary>
@@ -92,7 +144,7 @@ public class UltraKVConfig
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(80), // 960 bytes (80 regions)
         WriteBufferSize = 16 * 1024, // 16KB
-        ReadBufferSize = 16 * 1024 // 16KB
+        ReadBufferSize = 16 * 1024, // 16KB
     };
 
     /// <summary>
@@ -103,7 +155,7 @@ public class UltraKVConfig
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
         AllocationMultiplier = 1.5,
         WriteBufferSize = 1024 * 1024,
-        ReadBufferSize = 1024 * 1024
+        ReadBufferSize = 1024 * 1024,
     };
 
     /// <summary>
@@ -117,7 +169,9 @@ public class UltraKVConfig
         ReadBufferSize = 256 * 1024, // 256KB
     };
 
-    // HDD 优化配置
+    /// <summary>
+    /// HDD 优化配置
+    /// </summary>
     public static UltraKVConfig HDDOptimized => new()
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(1280), // 15360 bytes (1280 regions)
@@ -141,7 +195,7 @@ public class UltraKVConfig
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(640), // 7680 bytes (640 regions)
         CompressionType = CompressionType.Gzip,
         EncryptionType = EncryptionType.AES256GCM,
-        EncryptionKey = encryptionKey
+        EncryptionKey = encryptionKey,
     };
 
     public override string ToString()
@@ -152,6 +206,11 @@ public class UltraKVConfig
             $"Compression: {CompressionType}, " +
             $"Encryption: {EncryptionType}, " +
             $"WriteBuffer: {WriteBufferSize / 1024}KB, " +
-            $"ReadBuffer: {ReadBufferSize / 1024}KB";
+            $"ReadBuffer: {ReadBufferSize / 1024}KB, " +
+            $"GC: MinFile={GcMinFileSize / 1024}KB, " +
+            $"FreeThreshold={GcFreeSpaceThreshold:P1}, " +
+            $"MinRecords={GcMinRecordCount}, " +
+            $"AutoRecycle={GcAutoRecycleEnabled}, " +
+            $"FlushInterval={GcFlushIntervalMs}ms";
     }
 }

@@ -19,7 +19,7 @@ public struct DatabaseHeader
     public long CreatedTime;                // 8 bytes - 创建时间
     public long LastAccessTime;             // 8 bytes - 最后访问时间
     public uint Checksum;                   // 4 bytes - 校验和
-                                            // Total: 56 bytes
+                                            // Total: 52 bytes
 
     public const uint MAGIC_NUMBER = 0x554B5644; // "UKVD" - UltraKV Database
     public const ushort CURRENT_VERSION = 1;
