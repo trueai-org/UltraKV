@@ -195,7 +195,8 @@ public struct DatabaseHeader
                $"Compression: {CompressionType}, Encryption: {EncryptionType}, " +
                $"EnableMemoryMode: {EnableMemoryMode}, " +
                $"EnableFreeSpaceReuse: {EnableFreeSpaceReuse}, " +
-               $"FreeSpaceRegion: {FreeSpaceRegionSizeKB}KB, " +
+               $"FreeSpace: {FreeSpaceRegionSizeKB}KB, " +
+               $"FreeSpaceRegions: {FreeSpaceRegionSizeKB / FreeBlock.SIZE}, " +
                $"AllocationMultiplier: {GetActualAllocationMultiplier():F1}x, " +
                $"GcThreshold: {GetActualGcFreeSpaceThreshold():P1}, " +
                $"GcMinRecords: {GcMinRecordCount}, " +

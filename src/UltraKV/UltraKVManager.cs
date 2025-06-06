@@ -23,7 +23,7 @@ public class UltraKVManager : IDisposable
     {
         if (_disposed) throw new ObjectDisposedException(nameof(UltraKVManager));
 
-        return _engines.GetOrAdd(name, CreateEngine(name,config));
+        return _engines.GetOrAdd(name, CreateEngine(name, config));
     }
 
     private UltraKVEngine CreateEngine(string name, UltraKVConfig? config = null)
@@ -35,8 +35,8 @@ public class UltraKVManager : IDisposable
             if (_engines.TryGetValue(name, out var existing))
                 return existing;
 
-            var path = Path.Combine(_basePath, $"{name}.ultradb");
-            return new UltraKVEngine(path,config);
+            var path = Path.Combine(_basePath, $"{name}.ultrakv");
+            return new UltraKVEngine(path, config);
         }
         finally
         {

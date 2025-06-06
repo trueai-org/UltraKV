@@ -38,7 +38,10 @@ namespace UltraKV
                     EncryptionType = EncryptionType.AES256GCM,
                     EncryptionKey = "MyFixedTestKey12345678901234567890"
                 });
-                var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig { CompressionType = CompressionType.Gzip });
+                var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig
+                {
+                    CompressionType = CompressionType.Brotli
+                });
 
                 // 显示初始统计信息
                 Console.WriteLine("=== Initial Stats ===");
