@@ -21,16 +21,14 @@ public class UltraKVConfig
     /// 100000 ~ 1000000 条，32000 个区域（38.4M）
     /// 超过 1000000 条时，建议使用更大的区域数，例如 64000 或 128000 个区域（76.8M 或 153.6M）
     /// </summary>
-    public int FreeSpaceRegionSize { get; set; } = GetFreeSpaceRegionSize(320); // 320 regions * 12 bytes each = 3840 bytes
+    public uint FreeSpaceRegionSize { get; set; } = GetFreeSpaceRegionSize(320); // 320 regions * 12 bytes each = 3840 bytes
 
     /// <summary>
-    /// 原地更新时的空间分配倍数（百分比/10，0~255），默认 2，即 1.2 倍，配置规则为：1+n/10
+    /// 原地更新时的空间分配倍数（百分比，0~255），默认 20，即 1.20 倍，配置规则为：1+n/100
     /// 例如：
     /// 最小值为 0
-    /// 配置值为 2，则分配倍数为 1 + 2/10 = 1.2
-    /// 配置值为 10，则分配倍数为 1 + 10/10 = 2.0
-    /// 配置值为 20，则分配倍数为 1 + 20/10 = 3.0
-    /// 最大值为 255，则分配倍数为 1 + 255/10 = 26.5
+    /// 配置值为 20，则分配倍数为 1 + 20/100 = 1.20
+    /// 最大值为 255，则分配倍数为 1 + 255/100 = 3.55
     /// </summary>
     public byte AllocationMultiplier { get; set; } = 2;
 
@@ -50,34 +48,34 @@ public class UltraKVConfig
     public string? EncryptionKey { get; set; }
 
     /// <summary>
-    /// 写缓冲区大小，默认 64KB
+    /// 写缓冲区大小，单位：KB，默认 64KB
     /// </summary>
-    public int WriteBufferSize { get; set; } = 64 * 1024;
+    public uint WriteBufferSizeKB { get; set; } = 64;
 
     /// <summary>
-    /// 读缓冲区大小，默认 64KB
+    /// 读缓冲区大小，单位：KB，默认 64KB
     /// </summary>
-    public int ReadBufferSize { get; set; } = 64 * 1024;
+    public uint ReadBufferSizeKB { get; set; } = 64;
 
     // ==================== GC 配置项 ====================
 
     /// <summary>
-    /// GC 最小文件大小要求（字节），默认 1MB
+    /// GC 最小文件大小要求（单位 KB），默认 1024KB = 1MB
     /// 只有当文件大小超过此值时才会触发GC
     /// </summary>
-    public long GcMinFileSize { get; set; } = 1024 * 1024; // 1MB
+    public uint GcMinFileSizeKB { get; set; } = 1024; // 1024KB = 1MB
 
     /// <summary>
-    /// GC 累计空闲空间百分比阈值（百分比/10，0~255），默认 2，即：n/10 = 20%
+    /// GC 累计空闲空间百分比阈值（百分比，0~255），默认 20，即：20%
     /// 当累计空闲空间占总文件大小的百分比超过此值时触发GC
     /// </summary>
-    public byte GcFreeSpaceThreshold { get; set; } = 2; // 20%
+    public byte GcFreeSpaceThreshold { get; set; } = 20; // 20%
 
     /// <summary>
-    /// GC 最小数据条数要求，默认 100 条
+    /// GC 最小数据条数要求，默认 100 条，取值：0~65535
     /// 只有当数据条数超过此值时才会触发GC
     /// </summary>
-    public int GcMinRecordCount { get; set; } = 100;
+    public ushort GcMinRecordCount { get; set; } = 100;
 
     /// <summary>
     /// 是否开启空闲时自动回收，默认 false
@@ -86,26 +84,23 @@ public class UltraKVConfig
     public bool GcAutoRecycleEnabled { get; set; } = false;
 
     /// <summary>
-    /// 定期刷磁盘时间间隔（毫秒），默认 5 秒，最少 100ms，为 0 时表示不刷盘
+    /// 定期刷磁盘时间间隔（秒）（0~65535），默认 5 秒，为 0 时表示不刷盘
     /// 控制数据刷新到磁盘的频率
     /// </summary>
-    public int GcFlushIntervalMs { get; set; } = 5000; // 5 seconds
+    public ushort GcFlushInterval { get; set; } = 5; // 5 seconds
 
     /// <summary>
     /// 验证配置有效性
     /// </summary>
     public void Validate()
     {
-        if (FreeSpaceRegionSize < 1024)
-            throw new ArgumentException("FreeSpaceRegionSize must be at least 1KB");
+        if (FreeSpaceRegionSize < 960)
+            throw new ArgumentException("FreeSpaceRegionSize must be at least 960B");
 
-        if (AllocationMultiplier < 0 || AllocationMultiplier > 255)
-            throw new ArgumentException("AllocationMultiplier must be between 0 and 255");
-
-        if (WriteBufferSize < 4096)
+        if (WriteBufferSizeKB < 4)
             throw new ArgumentException("WriteBufferSize must be at least 4KB");
 
-        if (ReadBufferSize < 4096)
+        if (ReadBufferSizeKB < 4)
             throw new ArgumentException("ReadBufferSize must be at least 4KB");
 
         // 验证加密配置
@@ -119,31 +114,36 @@ public class UltraKVConfig
         }
 
         // 验证GC配置
-        if (GcMinFileSize < 0)
-            GcMinFileSize = 0;
-
-        if (GcFreeSpaceThreshold < 0.0)
-            GcFreeSpaceThreshold = 0;
+        if (GcMinFileSizeKB < 0)
+            GcMinFileSizeKB = 0;
 
         if (GcMinRecordCount < 0)
             GcMinRecordCount = 0;
 
-        if (GcFlushIntervalMs < 0)
-            GcFlushIntervalMs = 0;
+        if (GcFlushInterval < 0)
+            GcFlushInterval = 0;
 
-        if (GcFlushIntervalMs > 0 && GcFlushIntervalMs < 100)
-            GcFlushIntervalMs = 100;
+        if (GcFlushInterval < 0)
+            GcFlushInterval = 0;
+
+        if (GcFlushInterval > 65535)
+            GcFlushInterval = 65535; // 最大值为 65535 秒
     }
 
     /// <summary>
     /// 检查是否应该触发GC
     /// </summary>
     /// <param name="stats">数据库统计信息</param>
+    /// <param name="forceGc">是否强制GC（忽略所有条件检查）</param>
     /// <returns>是否应该触发GC</returns>
-    public bool ShouldTriggerGC(DatabaseStats stats)
+    public bool ShouldTriggerGC(DatabaseStats stats, bool forceGc = false)
     {
+        // 强制GC模式
+        if (forceGc)
+            return true;
+
         // 检查最小文件大小要求
-        if (stats.TotalFileSize < GcMinFileSize)
+        if (stats.TotalFileSize < GcMinFileSizeKB * 1024)
             return false;
 
         // 检查最小记录数要求
@@ -155,7 +155,23 @@ public class UltraKVConfig
             ? (double)stats.WastedSpace / stats.TotalFileSize
             : 0.0;
 
-        return freeSpaceRatio >= GcFreeSpaceThreshold / 10;
+        return freeSpaceRatio >= (GcFreeSpaceThreshold / 100.0);
+    }
+
+    /// <summary>
+    /// 获取实际的分配倍数
+    /// </summary>
+    public double GetActualAllocationMultiplier()
+    {
+        return 1.0 + AllocationMultiplier / 100.0;
+    }
+
+    /// <summary>
+    /// 获取实际的GC空闲空间阈值百分比
+    /// </summary>
+    public double GetActualGcFreeSpaceThreshold()
+    {
+        return GcFreeSpaceThreshold / 100.0;
     }
 
     /// <summary>
@@ -163,9 +179,9 @@ public class UltraKVConfig
     /// </summary>
     /// <param name="regionCount"></param>
     /// <returns></returns>
-    public static int GetFreeSpaceRegionSize(int regionCount)
+    public static uint GetFreeSpaceRegionSize(int regionCount)
     {
-        return regionCount * FreeBlock.SIZE; // 每个区域占用 12 字节
+        return (uint)regionCount * FreeBlock.SIZE; // 每个区域占用 12 字节
     }
 
     /// <summary>
@@ -179,8 +195,8 @@ public class UltraKVConfig
     public static UltraKVConfig Minimal => new()
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(80), // 960 bytes (80 regions)
-        WriteBufferSize = 16 * 1024, // 16KB
-        ReadBufferSize = 16 * 1024, // 16KB
+        WriteBufferSizeKB = 16, // 16KB
+        ReadBufferSizeKB = 16, // 16KB
     };
 
     /// <summary>
@@ -190,8 +206,8 @@ public class UltraKVConfig
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
         AllocationMultiplier = 5,
-        WriteBufferSize = 1024 * 1024,
-        ReadBufferSize = 1024 * 1024,
+        WriteBufferSizeKB = 1024, // 1MB
+        ReadBufferSizeKB = 1024, // 1MB
     };
 
     /// <summary>
@@ -201,8 +217,8 @@ public class UltraKVConfig
     {
         FreeSpaceRegionSize = GetFreeSpaceRegionSize(5120), // 61440 bytes (5120 regions)
         AllocationMultiplier = 5,
-        WriteBufferSize = 256 * 1024, // 256KB
-        ReadBufferSize = 256 * 1024, // 256KB
+        WriteBufferSizeKB = 256, // 256KB
+        ReadBufferSizeKB = 256, // 256KB
     };
 
     /// <summary>
@@ -237,17 +253,17 @@ public class UltraKVConfig
     public override string ToString()
     {
         return $"EnableFreeSpaceReuse: {EnableFreeSpaceReuse}, " +
-            $"FreeSpace: {FreeSpaceRegionSize / 1024}KB, " +
+            $"FreeSpace: {FreeSpaceRegionSize / 1024.0:F1}KB, " +
             $"FreeSpaceRegions: {FreeSpaceRegionSize / FreeBlock.SIZE}, " +
-            $"Multiplier: {1 + AllocationMultiplier / 10:F1}x, " +
+            $"Multiplier: {GetActualAllocationMultiplier():F1}x, " +
             $"Compression: {CompressionType}, " +
             $"Encryption: {EncryptionType}, " +
-            $"WriteBuffer: {WriteBufferSize / 1024}KB, " +
-            $"ReadBuffer: {ReadBufferSize / 1024}KB, " +
-            $"GC: MinFile={GcMinFileSize / 1024}KB, " +
-            $"FreeThreshold={GcFreeSpaceThreshold / 10:P1}, " +
+            $"WriteBuffer: {WriteBufferSizeKB}KB, " +
+            $"ReadBuffer: {ReadBufferSizeKB}KB, " +
+            $"GC: MinFile={GcMinFileSizeKB}KB, " +
+            $"FreeThreshold={GetActualGcFreeSpaceThreshold():P1}, " +
             $"MinRecords={GcMinRecordCount}, " +
             $"AutoRecycle={GcAutoRecycleEnabled}, " +
-            $"FlushInterval={GcFlushIntervalMs}ms";
+            $"FlushInterval={GcFlushInterval}s";
     }
 }

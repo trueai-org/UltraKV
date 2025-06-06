@@ -3,7 +3,7 @@
 namespace UltraKV;
 
 /// <summary>
-/// 数据库文件头结构（存储数据库级别的配置信息）
+/// 数据库文件头结构（存储数据库级别的配置信息）- 固定64字节
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct DatabaseHeader
@@ -13,17 +13,25 @@ public struct DatabaseHeader
     public CompressionType CompressionType; // 1 byte - 压缩类型
     public EncryptionType EncryptionType;   // 1 byte - 加密类型
     public uint FreeSpaceRegionSize;        // 4 bytes - 空闲空间区域大小
-    public byte AllocationMultiplier;       // 1 bytes - 预分配空间倍数，实际倍数算法：1 + n/10
-    public uint WriteBufferSize;            // 4 bytes - 写缓冲区大小
-    public uint ReadBufferSize;             // 4 bytes - 读缓冲区大小
+    public byte AllocationMultiplier;       // 1 byte - 预分配空间倍数百分比，实际倍数算法：1 + n/100
+    public byte GcFreeSpaceThreshold;       // 1 byte - GC空闲空间阈值百分比，实际阈值：n/100
+    public ushort GcMinRecordCount;         // 2 bytes - GC最小记录数要求
+    public uint WriteBufferSizeKB;          // 4 bytes - 写缓冲区大小（KB）
+    public uint ReadBufferSizeKB;           // 4 bytes - 读缓冲区大小（KB）
+    public uint GcMinFileSizeKB;            // 4 bytes - GC最小文件大小要求（KB）
+    public ushort GcFlushInterval;          // 2 bytes - GC刷盘间隔（秒）
+    public byte GcAutoRecycleEnabled;       // 1 byte - 是否开启自动GC
+    public byte EnableFreeSpaceReuse;       // 1 byte - 是否启用空间重复利用
     public long CreatedTime;                // 8 bytes - 创建时间
     public long LastAccessTime;             // 8 bytes - 最后访问时间
+    public long LastGcTime;                 // 8 bytes - 最后GC时间
+    public uint TotalGcCount;               // 4 bytes - 总GC次数
     public uint Checksum;                   // 4 bytes - 校验和
-                                            // Total: 52 bytes
+                                            // Total: 64 bytes
 
     public const uint MAGIC_NUMBER = 0x554B5644; // "UKVD" - UltraKV Database
     public const ushort CURRENT_VERSION = 1;
-    public const int SIZE = 52;
+    public const int SIZE = 64;
 
     public static DatabaseHeader Create(UltraKVConfig config)
     {
@@ -33,12 +41,20 @@ public struct DatabaseHeader
             Version = CURRENT_VERSION,
             CompressionType = config.CompressionType,
             EncryptionType = config.EncryptionType,
-            FreeSpaceRegionSize = (uint)config.FreeSpaceRegionSize,
+            FreeSpaceRegionSize = config.FreeSpaceRegionSize,
             AllocationMultiplier = config.AllocationMultiplier,
-            WriteBufferSize = (uint)config.WriteBufferSize,
-            ReadBufferSize = (uint)config.ReadBufferSize,
+            GcFreeSpaceThreshold = config.GcFreeSpaceThreshold,
+            GcMinRecordCount = Math.Min(config.GcMinRecordCount, ushort.MaxValue),
+            WriteBufferSizeKB = config.WriteBufferSizeKB,
+            ReadBufferSizeKB = config.ReadBufferSizeKB,
+            GcMinFileSizeKB = config.GcMinFileSizeKB, // 存储为KB
+            GcFlushInterval = Math.Min(config.GcFlushInterval, ushort.MaxValue),
+            GcAutoRecycleEnabled = config.GcAutoRecycleEnabled ? (byte)1 : (byte)0,
+            EnableFreeSpaceReuse = config.EnableFreeSpaceReuse ? (byte)1 : (byte)0,
             CreatedTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             LastAccessTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            LastGcTime = 0,
+            TotalGcCount = 0
         };
 
         header.Checksum = CalculateChecksum(header);
@@ -58,12 +74,82 @@ public struct DatabaseHeader
         Checksum = CalculateChecksum(this);
     }
 
+    public void UpdateGcTime()
+    {
+        LastGcTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        TotalGcCount++;
+        Checksum = CalculateChecksum(this);
+    }
+
+    /// <summary>
+    /// 获取实际的分配倍数
+    /// </summary>
+    public readonly double GetActualAllocationMultiplier()
+    {
+        return 1.0 + AllocationMultiplier / 100.0;
+    }
+
+    /// <summary>
+    /// 获取实际的GC空闲空间阈值
+    /// </summary>
+    public readonly double GetActualGcFreeSpaceThreshold()
+    {
+        return GcFreeSpaceThreshold / 100.0;
+    }
+
+    /// <summary>
+    /// 获取实际的GC最小文件大小（字节）
+    /// </summary>
+    public readonly long GetActualGcMinFileSize()
+    {
+        return (long)GcMinFileSizeKB * 1024;
+    }
+
+    /// <summary>
+    /// 获取实际的GC刷盘间隔（毫秒）
+    /// </summary>
+    public readonly int GetActualGcFlushInterval()
+    {
+        return GcFlushInterval * 1000;
+    }
+
+    /// <summary>
+    /// 是否启用自动GC
+    /// </summary>
+    public readonly bool IsGcAutoRecycleEnabled => GcAutoRecycleEnabled != 0;
+
+    /// <summary>
+    /// 是否启用空间重复利用
+    /// </summary>
+    public readonly bool IsFreeSpaceReuseEnabled => EnableFreeSpaceReuse != 0;
+
+    /// <summary>
+    /// 检查是否需要GC
+    /// </summary>
+    public readonly bool ShouldGC(long fileSize, long freeSpaceSize, int recordCount, bool forceGc = false)
+    {
+        if (forceGc)
+            return true;
+
+        // 检查最小文件大小
+        if (fileSize < GetActualGcMinFileSize())
+            return false;
+
+        // 检查最小记录数
+        if (recordCount < GcMinRecordCount)
+            return false;
+
+        // 检查空闲空间比例
+        var freeSpaceRatio = fileSize > 0 ? (double)freeSpaceSize / fileSize : 0.0;
+        return freeSpaceRatio >= GetActualGcFreeSpaceThreshold();
+    }
+
     private static unsafe uint CalculateChecksum(DatabaseHeader header)
     {
         var tempHeader = header;
         tempHeader.Checksum = 0; // 清零校验和字段
 
-        var bytes = new ReadOnlySpan<byte>(&tempHeader, SIZE - 4); // 排除校验和字段
+        var bytes = new ReadOnlySpan<byte>(&tempHeader, SIZE - 4); // 排除校验和字段和保留字段
         uint hash = 2166136261u; // FNV-1a初始值
 
         foreach (byte b in bytes)
@@ -73,5 +159,21 @@ public struct DatabaseHeader
         }
 
         return hash;
+    }
+
+    public override readonly string ToString()
+    {
+        return $"Magic: 0x{Magic:X8}, Version: {Version}, " +
+               $"Compression: {CompressionType}, Encryption: {EncryptionType}, " +
+               $"FreeSpaceRegion: {FreeSpaceRegionSize}B, " +
+               $"AllocationMultiplier: {GetActualAllocationMultiplier():F1}x, " +
+               $"GcThreshold: {GetActualGcFreeSpaceThreshold():P1}, " +
+               $"GcMinRecords: {GcMinRecordCount}, " +
+               $"GcMinFileSize: {GetActualGcMinFileSize() / 1024}KB, " +
+               $"GcFlushInterval: {GetActualGcFlushInterval()}ms, " +
+               $"AutoGC: {IsGcAutoRecycleEnabled}, " +
+               $"FreeSpaceReuse: {IsFreeSpaceReuseEnabled}, " +
+               $"GcCount: {TotalGcCount}, " +
+               $"Created: {DateTimeOffset.FromUnixTimeMilliseconds(CreatedTime):yyyy-MM-dd HH:mm:ss}";
     }
 }
