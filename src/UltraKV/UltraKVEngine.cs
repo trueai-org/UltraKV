@@ -58,6 +58,20 @@ public unsafe class UltraKVEngine : IDisposable
             // 新建数据库
             _databaseHeader = DatabaseHeader.Create(_config);
             WriteDatabaseHeader();
+
+            // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
+            var freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
+            _freeSpaceManager = freeSpaceManager;
+
+            // 保存空闲空间头部信息
+            _freeSpaceManager.SaveFreeSpaceHeader();
+
+            // 如果启动空闲空间重用
+            if (_config.EnableFreeSpaceReuse)
+            {
+                // 加载或创建空闲空间块信息
+                // TODO
+            }
         }
         else
         {
@@ -70,12 +84,36 @@ public unsafe class UltraKVEngine : IDisposable
 
             // 验证配置兼容性
             ValidateConfigCompatibility(_config);
+
+            // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
+            var freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
+            _freeSpaceManager = freeSpaceManager;
+
+            // 如果需要重建
+            if (_freeSpaceManager.NeedsRebuild(_databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse))
+            {
+                // 则调用 PerformShrink
+                var shrinkResult = PerformShrink();
+                Console.WriteLine($"Rebuilt free space manager: {shrinkResult}");
+            }
+
+            // 保存空闲空间头部信息
+            _freeSpaceManager.SaveFreeSpaceHeader();
+
+            // 如果启动空闲空间重用
+            if (_config.EnableFreeSpaceReuse)
+            {
+                // 加载或创建空闲空间块信息
+                // TODO
+            }
         }
 
-        // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
-        _freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
+
         _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
         _keyIndex = new ConcurrentDictionary<string, long>();
+
+        // 保存空闲空间头部信息
+        _freeSpaceManager.SaveFreeSpaceHeader();
 
         if (!isNewFile)
         {
@@ -257,16 +295,22 @@ public unsafe class UltraKVEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// 写入头部信息
+    /// </summary>
     private void WriteDatabaseHeader()
     {
-        _file.Seek(0, SeekOrigin.Begin);
-        var headerBytes = new byte[DatabaseHeader.SIZE];
-        fixed (byte* headerPtr = headerBytes)
+        lock (_writeLock)
         {
-            *(DatabaseHeader*)headerPtr = _databaseHeader;
+            _file.Seek(0, SeekOrigin.Begin);
+            var headerBytes = new byte[DatabaseHeader.SIZE];
+            fixed (byte* headerPtr = headerBytes)
+            {
+                *(DatabaseHeader*)headerPtr = _databaseHeader;
+            }
+            _file.Write(headerBytes, 0, DatabaseHeader.SIZE);
+            _file.Flush();
         }
-        _file.Write(headerBytes, 0, DatabaseHeader.SIZE);
-        _file.Flush();
     }
 
     private DatabaseHeader ReadDatabaseHeader()
@@ -778,7 +822,7 @@ public unsafe class UltraKVEngine : IDisposable
                 tempFile.Write(headerBytes, 0, DatabaseHeader.SIZE);
 
                 // 创建临时空闲空间管理器
-                using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, _databaseHeader.FreeSpaceRegionSizeKB * 1024);
+                using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
 
                 var newKeyIndex = new ConcurrentDictionary<string, long>();
                 var currentPosition = tempFreeSpaceManager.GetDataStartPosition();
