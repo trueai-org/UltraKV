@@ -542,6 +542,9 @@ public unsafe class UltraKVEngine : IDisposable
             int validRecords = 0;
             int totalRecordsProcessed = 0;
 
+            // 创建一个 _keyIndex 的副本，如果在文件移动失败时，重置索引副本
+            var originalKeyIndex = new ConcurrentDictionary<string, long>(_keyIndex);
+
             try
             {
                 using var tempFile = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write);
@@ -649,7 +652,16 @@ public unsafe class UltraKVEngine : IDisposable
                 var originalPath = _file.Name;
                 _file.Close();
 
-                File.Delete(originalPath);
+                // 在移动前需要清空索引，避免读取索引时发现文件不存在了
+                _keyIndex.Clear();
+
+                // 这里不能立即删除，而应该先备份
+                if (File.Exists(originalPath))
+                {
+                    try { File.Delete(originalPath + ".bak"); } catch { }
+                    File.Move(originalPath, originalPath + ".bak");
+                }
+
                 File.Move(tempFilePath, originalPath);
 
                 // 重新打开文件
@@ -690,6 +702,14 @@ public unsafe class UltraKVEngine : IDisposable
                 {
                     try { File.Delete(tempFilePath); } catch { }
                 }
+
+                // 恢复原始索引
+                _keyIndex.Clear();
+                foreach (var kvp in originalKeyIndex)
+                {
+                    _keyIndex[kvp.Key] = kvp.Value;
+                }
+
                 throw new InvalidOperationException($"Shrink operation failed: {ex.Message}", ex);
             }
         }
