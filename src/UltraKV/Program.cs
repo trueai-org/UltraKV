@@ -6,6 +6,10 @@ namespace UltraKV
     {
         private static void Main(string[] args)
         {
+            TestIndex();
+
+            return;
+
             Console.WriteLine("UltraKV Performance Benchmark - With Delete & Shrink Tests");
             Console.WriteLine($"Started at: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
 
@@ -446,6 +450,49 @@ namespace UltraKV
 
             Console.WriteLine("\nPress any key to exit...");
             Console.ReadKey();
+        }
+
+        public static void TestIndex()
+        {
+            // 清理可能存在的文件
+            var dataDir = "./ultra_data";
+            if (Directory.Exists(dataDir))
+            {
+                try
+                {
+                    Directory.Delete(dataDir, true);
+                    Thread.Sleep(100); // 等待文件系统释放句柄
+                }
+                catch { }
+            }
+            Directory.CreateDirectory(dataDir);
+
+            // 使用示例
+            var config = new UltraKVConfig
+            {
+                DefaultIndexPageSizeKB = 4, // 默认索引页大小64KB
+                EnableFreeSpaceReuse = false
+            };
+
+            using var engine = new UltraKVEngine(Path.Combine(dataDir, "test.db"), config);
+
+            // 添加数据 - 自动更新索引
+            engine.Put("user:1001", "John Doe");
+            engine.Put("user:1002", "Jane Smith");
+            engine.Put("order:5001", "Product A");
+
+            // 查询数据 - 使用索引加速
+            var user = engine.Get("user:1001"); // 通过索引快速查找
+
+            // 获取索引统计信息
+            var indexStats = engine.GetIndexStats();
+            Console.WriteLine($"Index stats: {indexStats}");
+
+            // 手动合并索引页（可选）
+            engine.ConsolidateIndexes();
+
+            // 刷新保存索引
+            engine.Flush();
         }
     }
 }

@@ -8,6 +8,7 @@ public unsafe class UltraKVEngine : IDisposable
 {
     private readonly FileStream _file;
     private readonly FreeSpaceManager _freeSpaceManager;
+    private readonly IndexManager _indexManager; // 新增索引管理器
     private readonly DataProcessor _dataProcessor;
     private readonly ConcurrentDictionary<string, long> _keyIndex;
     private readonly DatabaseHeader _databaseHeader;
@@ -16,7 +17,7 @@ public unsafe class UltraKVEngine : IDisposable
     private readonly Timer? _flushTimer;
     private bool _disposed;
     private DateTime _lastFlushTime = DateTime.UtcNow;
-    private readonly bool _enableUpdateValidation; // 新增：是否启用更新验证
+    private readonly bool _enableUpdateValidation;
 
     /// <summary>
     /// 加密数据头部结构
@@ -61,17 +62,25 @@ public unsafe class UltraKVEngine : IDisposable
 
             // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
             var freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
-            _freeSpaceManager = freeSpaceManager;
 
             // 保存空闲空间头部信息
-            _freeSpaceManager.CreateNewFreeSpaceHeader();
+            freeSpaceManager.CreateNewFreeSpaceHeader();
 
             // 如果启动空闲空间重用
             if (_config.EnableFreeSpaceReuse)
             {
                 // 创建空闲空间
-                _freeSpaceManager.CreateNewFreeSpaceRegion();
+                freeSpaceManager.CreateNewFreeSpaceRegion();
             }
+
+            // 初始化数据处理器
+            _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
+
+            // 初始化索引管理器
+            var firstIndexDataStartPosition = freeSpaceManager.GetFirstIndexDataStartPosition();
+            _indexManager = new IndexManager(_file, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
+
+            _freeSpaceManager = freeSpaceManager;
         }
         else
         {
@@ -87,29 +96,42 @@ public unsafe class UltraKVEngine : IDisposable
 
             // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
             var freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
-            _freeSpaceManager = freeSpaceManager;
+            
 
             // 如果需要重建
             // 重建后是没有空闲空间的
-            if (_freeSpaceManager.NeedsRebuild(_databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse))
+            if (freeSpaceManager.NeedsRebuild(_databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse))
             {
                 // 则调用 PerformShrink
                 var shrinkResult = PerformShrink();
+
                 Console.WriteLine($"Rebuilt free space manager: {shrinkResult}");
+
+                freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
             }
 
             // 保存空闲空间头部信息
-            _freeSpaceManager.SaveFreeSpaceHeader();
+            freeSpaceManager.SaveFreeSpaceHeader();
 
             // 如果启动空闲空间重用
             if (_config.EnableFreeSpaceReuse)
             {
                 // 加载空闲空间
-                _freeSpaceManager.LoadFreeSpaceRegion();
+                freeSpaceManager.LoadFreeSpaceRegion();
             }
+
+            // 初始化数据处理器
+            _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
+
+            // 初始化索引管理器
+            var firstIndexDataStartPosition = freeSpaceManager.GetFirstIndexDataStartPosition();
+            _indexManager = new IndexManager(_file, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
+
+
+            _freeSpaceManager = freeSpaceManager;
         }
 
-        _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
+
         _keyIndex = new ConcurrentDictionary<string, long>();
 
         if (!isNewFile)
@@ -350,7 +372,6 @@ public unsafe class UltraKVEngine : IDisposable
         if (string.IsNullOrEmpty(key))
             throw new ArgumentException("Key cannot be null or empty");
 
-        // 验证 key 长度
         ValidateKey(key);
 
         using var record = new Record(key, value);
@@ -362,13 +383,18 @@ public unsafe class UltraKVEngine : IDisposable
             if (_keyIndex.TryGetValue(key, out var oldPosition))
             {
                 MarkAsDeleted(oldPosition);
+                _indexManager.RemoveIndex(key); // 更新索引
             }
+
+            // 首先更新索引位置
+            // 更新索引
+            _indexManager.AddOrUpdateIndex(key);
 
             long position;
 
             if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
             {
-                // 加密/压缩模式：使用新的存储格式
+                // 加密/压缩模式
                 var processedData = _dataProcessor.ProcessData(rawData);
 
                 var encryptedHeader = new EncryptedDataHeader
@@ -383,7 +409,6 @@ public unsafe class UltraKVEngine : IDisposable
                 var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
                 var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
 
-                // 寻找合适的空闲空间（如果启用了空闲空间重用）
                 if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
                 {
                     position = freeBlock.Position;
@@ -399,7 +424,6 @@ public unsafe class UltraKVEngine : IDisposable
                     _file.SetLength(position + multipliedSize);
                 }
 
-                // 写入加密数据头部 + 加密数据
                 _file.Seek(position, SeekOrigin.Begin);
                 var headerBytes = new byte[EncryptedDataHeader.SIZE];
                 fixed (byte* headerPtr = headerBytes)
@@ -411,7 +435,7 @@ public unsafe class UltraKVEngine : IDisposable
             }
             else
             {
-                // 非加密模式：使用原有格式
+                // 非加密模式
                 var requiredSize = rawData.Length;
                 var multipliedSize = (int)(requiredSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
 
@@ -430,7 +454,6 @@ public unsafe class UltraKVEngine : IDisposable
                     _file.SetLength(position + multipliedSize);
                 }
 
-                // 直接写入原始数据
                 _file.Seek(position, SeekOrigin.Begin);
                 _file.Write(rawData);
             }
@@ -438,7 +461,6 @@ public unsafe class UltraKVEngine : IDisposable
             _file.Flush();
             _keyIndex[key] = position;
 
-            // 如果启用了更新验证，验证刚写入的数据
             if (_enableUpdateValidation)
             {
                 ValidateWrittenData(key, value, position);
@@ -446,10 +468,20 @@ public unsafe class UltraKVEngine : IDisposable
         }
     }
 
+
     public string? Get(string key)
     {
-        if (string.IsNullOrEmpty(key) || !_keyIndex.TryGetValue(key, out var position))
+        if (string.IsNullOrEmpty(key))
             return null;
+
+        // 首先尝试从索引查找
+        var position = _indexManager.FindIndex(key);
+        if (position == -1)
+        {
+            // 索引中没有找到，尝试从内存索引查找
+            if (!_keyIndex.TryGetValue(key, out position))
+                return null;
+        }
 
         try
         {
@@ -457,7 +489,7 @@ public unsafe class UltraKVEngine : IDisposable
 
             if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
             {
-                // 加密/压缩模式：读取加密数据头部
+                // 加密/压缩模式
                 var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
                 if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
                     return null;
@@ -468,18 +500,16 @@ public unsafe class UltraKVEngine : IDisposable
                     if (encryptedHeader.IsDeleted != 0)
                     {
                         _keyIndex.TryRemove(key, out _);
+                        _indexManager.RemoveIndex(key);
                         return null;
                     }
 
-                    // 读取加密数据
                     var encryptedData = new byte[encryptedHeader.EncryptedSize];
                     if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) != encryptedHeader.EncryptedSize)
                         return null;
 
-                    // 解密+解压缩
                     var processedData = _dataProcessor.UnprocessData(encryptedData);
 
-                    // 解析记录
                     fixed (byte* dataPtr = processedData)
                     {
                         var record = new Record(dataPtr, processedData.Length);
@@ -489,7 +519,7 @@ public unsafe class UltraKVEngine : IDisposable
             }
             else
             {
-                // 非加密模式：使用原有逻辑
+                // 非加密模式
                 var headerBuffer = new byte[RecordHeader.SIZE];
                 if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
                     return null;
@@ -500,6 +530,7 @@ public unsafe class UltraKVEngine : IDisposable
                     if (header.IsDeleted != 0)
                     {
                         _keyIndex.TryRemove(key, out _);
+                        _indexManager.RemoveIndex(key);
                         return null;
                     }
 
@@ -537,6 +568,7 @@ public unsafe class UltraKVEngine : IDisposable
         {
             MarkAsDeleted(position);
             _keyIndex.TryRemove(key, out _);
+            _indexManager.RemoveIndex(key); // 更新索引
             return true;
         }
     }
@@ -577,7 +609,7 @@ public unsafe class UltraKVEngine : IDisposable
 
                 if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
                 {
-                    // 加密模式：读取EncryptedDataHeader
+                    // 加密模式处理
                     var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
                     if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
                         break;
@@ -589,13 +621,11 @@ public unsafe class UltraKVEngine : IDisposable
 
                         if (encryptedHeader.IsDeleted == 0)
                         {
-                            // 读取加密数据
                             var encryptedData = new byte[encryptedHeader.EncryptedSize];
                             if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) == encryptedHeader.EncryptedSize)
                             {
                                 try
                                 {
-                                    // 解密+解压缩
                                     var processedData = _dataProcessor.UnprocessData(encryptedData);
 
                                     fixed (byte* dataPtr = processedData)
@@ -603,6 +633,7 @@ public unsafe class UltraKVEngine : IDisposable
                                         var record = new Record(dataPtr, processedData.Length);
                                         var key = record.GetKey();
                                         _keyIndex[key] = position;
+                                        _indexManager.AddOrUpdateIndex(key); // 重建索引
                                     }
                                 }
                                 catch
@@ -613,7 +644,6 @@ public unsafe class UltraKVEngine : IDisposable
                         }
                         else
                         {
-                            // 已删除的记录，加入空闲空间
                             _freeSpaceManager.AddFreeSpace(position, totalSize);
                         }
 
@@ -622,7 +652,7 @@ public unsafe class UltraKVEngine : IDisposable
                 }
                 else
                 {
-                    // 非加密模式：使用原有逻辑
+                    // 非加密模式处理
                     var headerBuffer = new byte[RecordHeader.SIZE];
                     if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
                         break;
@@ -643,6 +673,7 @@ public unsafe class UltraKVEngine : IDisposable
                                     var record = new Record(dataPtr, recordData.Length);
                                     var key = record.GetKey();
                                     _keyIndex[key] = position;
+                                    _indexManager.AddOrUpdateIndex(key); // 重建索引
                                 }
                             }
                         }
@@ -661,6 +692,9 @@ public unsafe class UltraKVEngine : IDisposable
                 break;
             }
         }
+
+        // 保存重建的索引
+        _indexManager.SaveChanges();
     }
 
     public bool ContainsKey(string key)
@@ -746,6 +780,8 @@ public unsafe class UltraKVEngine : IDisposable
         {
             _file.Flush();
             _freeSpaceManager.SaveFreeSpaceRegion();
+
+            _indexManager.SaveChanges(); // 保存索引更改
         }
     }
 
@@ -1204,11 +1240,33 @@ public unsafe class UltraKVEngine : IDisposable
             var headerBytes = new ReadOnlySpan<byte>(&updatedHeader, DatabaseHeader.SIZE);
             _file.Write(headerBytes);
 
+            _indexManager?.Dispose(); // 释放索引管理器
             _freeSpaceManager?.Dispose();
             _dataProcessor?.Dispose();
             _file?.Dispose();
             _disposed = true;
         }
+    }
+
+
+    /// <summary>
+    /// 合并索引 - 将所有索引页合并到第一个索引页
+    /// </summary>
+    public void ConsolidateIndexes()
+    {
+        lock (_writeLock)
+        {
+            _indexManager.ConsolidateIndexPages();
+            Console.WriteLine("Index consolidation completed");
+        }
+    }
+
+    /// <summary>
+    /// 获取索引统计信息
+    /// </summary>
+    public IndexStats GetIndexStats()
+    {
+        return _indexManager.GetStats();
     }
 }
 

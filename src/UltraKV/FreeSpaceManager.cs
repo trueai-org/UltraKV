@@ -479,6 +479,11 @@ public unsafe class FreeSpaceManager : IDisposable
     public long GetDataStartPosition() => FreeSpaceStartPosition + _regionSize;
 
     /// <summary>
+    /// 获取第一个索引数据开始位置
+    /// </summary>
+    public long GetFirstIndexDataStartPosition() => FreeSpaceStartPosition + _regionSize;
+
+    /// <summary>
     /// 获取统计信息
     /// </summary>
     public FreeSpaceStats GetStats()
