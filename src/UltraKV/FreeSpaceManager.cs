@@ -125,24 +125,35 @@ public struct FreeSpaceHeader
 /// </summary>
 public unsafe class FreeSpaceManager : IDisposable
 {
+    /// <summary>
+    /// 空闲空间区域的起始位置（固定在1024字节开始）
+    /// </summary>
+    public const long FreeSpaceStartPosition = 1024;
+
     private readonly FileStream _file;
-    private readonly long _regionStartPosition;
     private readonly int _regionSize;
     private readonly byte* _regionBuffer;
     private readonly List<FreeBlock> _freeBlocks;
     private readonly object _lock = new object();
+    private readonly bool _enableFreeSpaceReuse;
     private FreeSpaceHeader _header;
     private bool _disposed;
+
+    // **脏标记（Dirty Flag）**的作用，这是一个常见的性能优化模式。
+    // 避免不必要的磁盘写入
+
     private bool _isDirty;
 
-    public FreeSpaceManager(FileStream file, int regionSize, bool enableFreeSpaceReuse = true)
+    public FreeSpaceManager(FileStream file, int regionSize, bool enableFreeSpaceReuse)
     {
+        _enableFreeSpaceReuse = enableFreeSpaceReuse;
         _file = file;
         _regionSize = enableFreeSpaceReuse ? regionSize : 0; // 禁用时不创建空闲空间
-        _regionStartPosition = DatabaseHeader.SIZE + FreeSpaceHeader.SIZE; // 固定在数据库头+空闲空间头后面
+
         _regionBuffer = (byte*)Marshal.AllocHGlobal(_regionSize);
         _freeBlocks = new List<FreeBlock>();
 
+        // 加载空闲空间头信息
         LoadFreeSpaceHeader();
     }
 
@@ -153,7 +164,7 @@ public unsafe class FreeSpaceManager : IDisposable
     /// <exception cref="InvalidOperationException"></exception>
     public void LoadFreeSpaceHeader()
     {
-        if (_file.Length < _regionStartPosition)
+        if (_file.Length < DatabaseHeader.SIZE + FreeSpaceHeader.SIZE)
             return;
 
         _file.Seek(DatabaseHeader.SIZE, SeekOrigin.Begin);
@@ -170,6 +181,18 @@ public unsafe class FreeSpaceManager : IDisposable
             throw new InvalidOperationException("Invalid free space header.");
     }
 
+    /// <summary>
+    /// 创建新的空闲空间头部
+    /// </summary>
+    public void CreateNewFreeSpaceHeader()
+    {
+        _header = FreeSpaceHeader.Create(_regionSize, _enableFreeSpaceReuse);
+
+        // 立即保存头部信息
+        SaveFreeSpaceHeader();
+
+        Console.WriteLine($"Created new free space header: Enabled={_header.IsEnabled}, RegionSize={_header.IsFreeSpaceEnabled}");
+    }
 
     /// <summary>
     /// 保存空闲空间头部信息
@@ -178,6 +201,13 @@ public unsafe class FreeSpaceManager : IDisposable
     {
         lock (_lock)
         {
+            // 确保文件有足够的空间
+            var requiredLength = DatabaseHeader.SIZE + FreeSpaceHeader.SIZE;
+            if (_file.Length < requiredLength)
+            {
+                _file.SetLength(requiredLength);
+            }
+
             // 写入头部到文件
             _file.Seek(DatabaseHeader.SIZE, SeekOrigin.Begin);
             var headerBytes = new byte[FreeSpaceHeader.SIZE];
@@ -212,108 +242,37 @@ public unsafe class FreeSpaceManager : IDisposable
     }
 
     /// <summary>
-    /// 加载或创建空闲空间区域
+    /// 加载空闲空间区域
     /// </summary>
-    private void LoadOrCreateFreeSpaceRegion(bool enableFreeSpaceReuse)
+    public void LoadFreeSpaceRegion()
     {
-        try
+        // 检查文件是否包含空闲空间区域
+        if (_file.Length >= FreeSpaceStartPosition)
         {
-            // 检查文件是否包含空闲空间区域
-            if (_file.Length >= _regionStartPosition)
-            {
-                // 加载现有区域
-                LoadExistingFreeSpaceRegion();
-            }
-
-            // 创建新的空闲空间区域
-            CreateNewFreeSpaceRegion(enableFreeSpaceReuse, 0);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error loading free space region: {ex.Message}");
-            CreateNewFreeSpaceRegion(enableFreeSpaceReuse, 0);
+            // 加载现有区域
+            LoadExistingFreeSpaceRegion();
         }
     }
 
     /// <summary>
     /// 创建新的空闲空间区域
     /// </summary>
-    private void CreateNewFreeSpaceRegion(bool enableFreeSpaceReuse, long oldRegionSize)
+    public void CreateNewFreeSpaceRegion()
     {
-        _header = FreeSpaceHeader.Create(_regionSize, enableFreeSpaceReuse);
         _freeBlocks.Clear();
 
         // 确保文件有足够空间
-        var requiredSize = _regionStartPosition + _regionSize;
+        var requiredSize = FreeSpaceStartPosition + _regionSize;
         if (_file.Length < requiredSize)
         {
             _file.SetLength(requiredSize);
         }
 
         _isDirty = true;
+
         SaveFreeSpaceRegion();
 
-        Console.WriteLine($"Created new free space region: Size={_regionSize}, Enabled={enableFreeSpaceReuse}");
-    }
-
-    /// <summary>
-    /// 调整空闲空间区域大小（需要数据迁移）
-    /// </summary>
-    private void ResizeFreeSpaceRegion(FreeSpaceHeader oldHeader, bool enableFreeSpaceReuse)
-    {
-        var oldRegionSize = (int)oldHeader.RegionSize;
-        var sizeDiff = _regionSize - oldRegionSize;
-
-        Console.WriteLine($"Resizing free space region from {oldRegionSize} to {_regionSize} bytes (diff: {sizeDiff})");
-
-        if (sizeDiff != 0)
-        {
-            // 需要移动数据
-            var dataStartPosition = _regionStartPosition + oldRegionSize;
-            var newDataStartPosition = _regionStartPosition + _regionSize;
-
-            if (_file.Length > dataStartPosition)
-            {
-                var dataSize = _file.Length - dataStartPosition;
-
-                if (dataSize > 0)
-                {
-                    // 先读取所有数据
-                    var dataBuffer = new byte[dataSize];
-                    _file.Seek(dataStartPosition, SeekOrigin.Begin);
-                    _file.Read(dataBuffer, 0, (int)dataSize);
-
-                    // 调整文件大小
-                    _file.SetLength(newDataStartPosition + dataSize);
-
-                    // 将数据写入新位置
-                    _file.Seek(newDataStartPosition, SeekOrigin.Begin);
-                    _file.Write(dataBuffer, 0, (int)dataSize);
-
-                    Console.WriteLine($"Migrated {dataSize} bytes of data due to region resize");
-                }
-            }
-        }
-
-        // 创建新头部，保留统计信息
-        _header = oldHeader;
-        _header.RegionSize = _regionSize;
-        _header.IsEnabled = enableFreeSpaceReuse ? (byte)1 : (byte)0;
-
-        // 如果禁用了空闲空间重用，清空块列表
-        if (!enableFreeSpaceReuse)
-        {
-            _freeBlocks.Clear();
-            _header.BlockCount = 0;
-        }
-        else
-        {
-            // 重新加载空闲块
-            LoadFreeBlocks(oldHeader);
-        }
-
-        _isDirty = true;
-        SaveFreeSpaceRegion();
+        Console.WriteLine($"Created new free space region: Size={_regionSize}, Enabled={_header.IsEnabled}");
     }
 
     /// <summary>
@@ -338,8 +297,8 @@ public unsafe class FreeSpaceManager : IDisposable
     {
         try
         {
-            _file.Seek(_regionStartPosition + FreeSpaceHeader.SIZE, SeekOrigin.Begin);
-            var maxBlocks = (_regionSize - FreeSpaceHeader.SIZE) / FreeBlock.SIZE;
+            _file.Seek(FreeSpaceStartPosition, SeekOrigin.Begin);
+            var maxBlocks = _regionSize / FreeBlock.SIZE;
             var blocksToRead = Math.Min(header.BlockCount, maxBlocks);
 
             for (int i = 0; i < blocksToRead; i++)
@@ -362,8 +321,9 @@ public unsafe class FreeSpaceManager : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error loading free blocks: {ex.Message}");
             _freeBlocks.Clear();
+
+            Console.WriteLine($"Error loading free blocks: {ex.Message}");
         }
     }
 
@@ -487,9 +447,6 @@ public unsafe class FreeSpaceManager : IDisposable
                 // 清空缓冲区
                 new Span<byte>(_regionBuffer, _regionSize).Clear();
 
-                // 写入头部
-                *(FreeSpaceHeader*)_regionBuffer = _header;
-
                 // 只有启用时才写入空闲块数据
                 if (_header.IsFreeSpaceEnabled)
                 {
@@ -502,7 +459,7 @@ public unsafe class FreeSpaceManager : IDisposable
                 }
 
                 // 写入文件
-                _file.Seek(_regionStartPosition, SeekOrigin.Begin);
+                _file.Seek(FreeSpaceStartPosition, SeekOrigin.Begin);
                 var span = new ReadOnlySpan<byte>(_regionBuffer, _regionSize);
                 _file.Write(span);
                 _file.Flush();
@@ -519,7 +476,7 @@ public unsafe class FreeSpaceManager : IDisposable
     /// <summary>
     /// 获取数据开始位置
     /// </summary>
-    public long GetDataStartPosition() => _regionStartPosition + _regionSize;
+    public long GetDataStartPosition() => FreeSpaceStartPosition + _regionSize;
 
     /// <summary>
     /// 获取统计信息
@@ -573,7 +530,6 @@ public unsafe class FreeSpaceManager : IDisposable
             _disposed = true;
         }
     }
-
 }
 
 /// <summary>

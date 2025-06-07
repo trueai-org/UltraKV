@@ -64,13 +64,13 @@ public unsafe class UltraKVEngine : IDisposable
             _freeSpaceManager = freeSpaceManager;
 
             // 保存空闲空间头部信息
-            _freeSpaceManager.SaveFreeSpaceHeader();
+            _freeSpaceManager.CreateNewFreeSpaceHeader();
 
             // 如果启动空闲空间重用
             if (_config.EnableFreeSpaceReuse)
             {
-                // 加载或创建空闲空间块信息
-                // TODO
+                // 创建空闲空间
+                _freeSpaceManager.CreateNewFreeSpaceRegion();
             }
         }
         else
@@ -90,6 +90,7 @@ public unsafe class UltraKVEngine : IDisposable
             _freeSpaceManager = freeSpaceManager;
 
             // 如果需要重建
+            // 重建后是没有空闲空间的
             if (_freeSpaceManager.NeedsRebuild(_databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse))
             {
                 // 则调用 PerformShrink
@@ -103,17 +104,13 @@ public unsafe class UltraKVEngine : IDisposable
             // 如果启动空闲空间重用
             if (_config.EnableFreeSpaceReuse)
             {
-                // 加载或创建空闲空间块信息
-                // TODO
+                // 加载空闲空间
+                _freeSpaceManager.LoadFreeSpaceRegion();
             }
         }
 
-
         _dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
         _keyIndex = new ConcurrentDictionary<string, long>();
-
-        // 保存空闲空间头部信息
-        _freeSpaceManager.SaveFreeSpaceHeader();
 
         if (!isNewFile)
         {
@@ -823,6 +820,13 @@ public unsafe class UltraKVEngine : IDisposable
 
                 // 创建临时空闲空间管理器
                 using var tempFreeSpaceManager = new FreeSpaceManager(tempFile, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
+                tempFreeSpaceManager.CreateNewFreeSpaceHeader();
+
+                if (_config.EnableFreeSpaceReuse)
+                {
+                    // 创建新的空闲空间区域
+                    tempFreeSpaceManager.CreateNewFreeSpaceRegion();
+                }
 
                 var newKeyIndex = new ConcurrentDictionary<string, long>();
                 var currentPosition = tempFreeSpaceManager.GetDataStartPosition();

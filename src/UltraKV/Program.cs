@@ -44,7 +44,8 @@ namespace UltraKV
                 var engine2 = manager.GetEngine("benchmark_uncompressed", new UltraKVConfig
                 {
                     EnableUpdateValidation = true,
-                    CompressionType = CompressionType.Brotli
+                    CompressionType = CompressionType.Brotli,
+                    FreeSpaceRegionSizeKB = 1
                 });
 
                 // 显示初始统计信息
