@@ -3,7 +3,7 @@
 namespace UltraKV;
 
 /// <summary>
-/// 索引块结构 - 16字节
+/// 索引块结构 - 固定16字节
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct IndexBlock
@@ -29,7 +29,7 @@ public struct IndexBlock
 }
 
 /// <summary>
-/// 索引页内的单个索引条目
+/// 索引页内的单个索引条目 - 固定16字节
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct IndexEntry
@@ -37,10 +37,9 @@ public struct IndexEntry
     public long Position;           // 8 bytes - 值数据在文件中的位置
     public int KeyLength;           // 4 bytes - Key长度
     public byte IsDeleted;          // 1 byte - 删除标记
+    public byte PageIndex;          // 1 byte - 所在索引页的索引
+                                    // Total: 14 bytes
 
-    public ushort Reserved2;        // 2 byte - 保留字段
-    public byte Reserved1;          // 1 byte - 保留字段
-                                    // Total: 16 bytes
 
     public const int SIZE = 16;
 
@@ -49,11 +48,18 @@ public struct IndexEntry
         Position = position;
         KeyLength = keyLength;
         IsDeleted = isDeleted ? (byte)1 : (byte)0;
-        Reserved1 = 0;
-        Reserved2 = 0;
+        PageIndex = 0;
     }
 
-    public bool IsValidEntry => Position > 0 && KeyLength > 0 && IsDeleted == 0;
+    /// <summary>
+    /// 不验证 position
+    /// </summary>
+    public bool IsValidEntry => KeyLength > 0 && IsDeleted == 0;
+
+    /// <summary>
+    /// 
+    /// </summary>
+    public bool IsValidEntryValue => IsValidEntry && Position >= 0;
 
     public override string ToString()
     {

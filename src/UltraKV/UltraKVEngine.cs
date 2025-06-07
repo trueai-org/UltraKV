@@ -383,7 +383,9 @@ public unsafe class UltraKVEngine : IDisposable
             if (_keyIndex.TryGetValue(key, out var oldPosition))
             {
                 MarkAsDeleted(oldPosition);
-                _indexManager.RemoveIndex(key); // 更新索引
+
+                // 不需要删除
+                //_indexManager.RemoveIndex(key); // 更新索引
             }
 
             // 首先更新索引位置

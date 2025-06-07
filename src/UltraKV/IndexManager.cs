@@ -34,6 +34,11 @@ public unsafe class IndexManager : IDisposable
     /// </summary>
     public readonly long _firstIndexDataStartPosition;
 
+    /// <summary>
+    /// 记录 key 和 keyEntry 的映射关系
+    /// </summary>
+    private readonly ConcurrentDictionary<string, IndexEntry> _keyToEntryMap;
+
     public IndexManager(FileStream file, DatabaseHeader databaseHeader, DataProcessor dataProcessor, long firstIndexDataStartPosition)
     {
         _firstIndexDataStartPosition = firstIndexDataStartPosition;
@@ -42,6 +47,7 @@ public unsafe class IndexManager : IDisposable
         _dataProcessor = dataProcessor;
         _indexBlocks = new IndexBlock[IndexHeader.MAX_INDEX_PAGES];
         _indexPages = new ConcurrentDictionary<uint, IndexPageInfo>();
+        _keyToEntryMap = new ConcurrentDictionary<string, IndexEntry>();
 
         LoadIndexHeader();
         LoadIndexBlocks();
@@ -104,7 +110,7 @@ public unsafe class IndexManager : IDisposable
     /// </summary>
     private void LoadIndexBlocks()
     {
-        if (_file.Length < INDEX_BLOCKS_OFFSET + (IndexHeader.MAX_INDEX_PAGES * IndexBlock.SIZE))
+        if (_file.Length < INDEX_BLOCKS_OFFSET)
             return;
 
         _file.Seek(INDEX_BLOCKS_OFFSET, SeekOrigin.Begin);
@@ -156,14 +162,14 @@ public unsafe class IndexManager : IDisposable
             var block = _indexBlocks[i];
             if (block.IsValid)
             {
-                try
+                var pageInfo = LoadIndexPage(block);
+                _indexPages.TryAdd((uint)i, pageInfo);
+
+                var kvs = pageInfo.GetAllEntries();
+                foreach (var item in kvs)
                 {
-                    var pageInfo = LoadIndexPage(block);
-                    _indexPages.TryAdd((uint)i, pageInfo);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Warning: Failed to load index page {i}: {ex.Message}");
+                    // 将key和条目信息添加到映射中
+                    _keyToEntryMap.TryAdd(item.Key, item.Value);
                 }
             }
         }
@@ -174,18 +180,52 @@ public unsafe class IndexManager : IDisposable
     /// </summary>
     private IndexPageInfo LoadIndexPage(IndexBlock block)
     {
-        _file.Seek(block.Position, SeekOrigin.Begin);
-        var buffer = new byte[block.Size];
-        _file.Read(buffer, 0, (int)block.Size);
-
-        // 如果启用了压缩/加密，需要解压缩/解密
-        if (_databaseHeader.CompressionType != CompressionType.None ||
-            _databaseHeader.EncryptionType != EncryptionType.None)
+        if (_file.Length < block.Position + block.Size)
         {
-            buffer = _dataProcessor.UnprocessData(buffer);
+            throw new InvalidOperationException($"Index page at position {block.Position} with size {block.Size} is invalid.");
         }
 
-        return new IndexPageInfo(buffer);
+        _file.Seek(block.Position, SeekOrigin.Begin);
+        var buffer = new byte[block.Size];
+        if (_file.Read(buffer, 0, buffer.Length) != buffer.Length)
+        {
+            throw new InvalidOperationException($"Failed to read index page at position {block.Position}.");
+        }
+
+        //// 从文件加载索引页头信息
+        //fixed (byte* ptr = buffer)
+        //{
+        //    var header = *(IndexPageHeader*)ptr;
+        //    if (!header.IsValid)
+        //    {
+        //        throw new InvalidOperationException($"Invalid index page header at position {block.Position}.");
+        //    }
+        //}
+
+        return new IndexPageInfo(buffer, _dataProcessor);
+    }
+
+    /// <summary>
+    /// 查找已存在的索引条目（基于原始key比较）
+    /// </summary>
+    /// <param name="key">要查找的key</param>
+    /// <returns>如果找到返回条目信息，否则返回null</returns>
+    private (IndexEntry Entry, uint PageIndex)? FindExistingIndexEntry(string key)
+    {
+        // 遍历所有索引页查找key
+        for (uint i = 0; i < _indexHeader.IndexPageCount; i++)
+        {
+            if (_indexPages.TryGetValue(i, out var pageInfo))
+            {
+                var entry = pageInfo.FindEntryByKey(key);
+                if (entry.HasValue)
+                {
+                    return (entry.Value, i);
+                }
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -198,22 +238,46 @@ public unsafe class IndexManager : IDisposable
         if (string.IsNullOrEmpty(key))
             return null;
 
-        var keyBytes = Encoding.UTF8.GetBytes(key);
-
         lock (_lock)
         {
             try
             {
-                // 预分配数据位置
-                // 不确定当前 key 应该存储到哪个位置
-                // -1 表示未分配
-                var valuePosition = -1;
+                if (_keyToEntryMap.TryGetValue(key, out var v) && v.IsValidEntry)
+                {
+                    // Key已存在，直接返回现有的索引信息
+                    return new IndexReservation
+                    {
+                        Key = key,
+                        DataPosition = v.Position, // 使用现有位置
+                        IndexEntry = v,
+                        PageIndex = v.PageIndex,
+                        ReservationTime = DateTime.UtcNow,
+                    };
+                }
 
-                // 2. 创建索引条目，只记录位置和长度
-                var entry = new IndexEntry(valuePosition, keyBytes.Length);
+                //// 1. 首先检查key是否已经存在（基于原始key，而非加密内容）
+                //var existingEntry = FindExistingIndexEntry(key);
+                //if (existingEntry.HasValue)
+                //{
+                //    // Key已存在，只需要返回现有的索引信息，不需要更新加密内容
+                //    return new IndexReservation
+                //    {
+                //        Key = key,
+                //        DataPosition = existingEntry.Value.Entry.Position, // 使用现有位置
+                //        IndexEntry = existingEntry.Value.Entry,
+                //        PageIndex = existingEntry.Value.PageIndex,
+                //        ReservationTime = DateTime.UtcNow,
+                //    };
+                //}
 
-                // 3. 查找有空闲空间的索引页
-                var pageIndex = FindAvailableIndexPage(key, entry);
+                // 处理key（可能需要加密/压缩）
+                var processedKeyData = ProcessKey(key);
+
+                // 创建索引条目，值位置暂时设为-1（未分配）
+                var entry = new IndexEntry(-1, processedKeyData.Length);
+
+                // 查找有空闲空间的索引页
+                var pageIndex = FindAvailableIndexPage(key, entry, processedKeyData);
                 if (pageIndex == null)
                 {
                     // 没有可用页面，创建新的索引页
@@ -224,19 +288,22 @@ public unsafe class IndexManager : IDisposable
                     }
                 }
 
-                // 4. 在找到的索引页中写入索引信息和key值
+                // 在找到的索引页中写入索引信息和key值
                 if (_indexPages.TryGetValue(pageIndex.Value, out var pageInfo))
                 {
-                    if (pageInfo.AddOrUpdateEntry(key, entry))
+                    entry.PageIndex = pageIndex.Value;
+                    if (pageInfo.AddOrUpdateEntry(key, entry, processedKeyData))
                     {
                         _isDirty = true;
                         UpdateIndexStats();
+
+                        _keyToEntryMap.AddOrUpdate(key, entry, (k, v) => entry);
 
                         // 返回预留信息
                         return new IndexReservation
                         {
                             Key = key,
-                            DataPosition = valuePosition,
+                            DataPosition = -1,  // 稍后在确认时设置实际位置
                             IndexEntry = entry,
                             PageIndex = pageIndex.Value,
                             ReservationTime = DateTime.UtcNow
@@ -255,18 +322,101 @@ public unsafe class IndexManager : IDisposable
     }
 
     /// <summary>
+    /// 确认索引条目 - 数据写入成功后更新实际的数据位置
+    /// </summary>
+    /// <param name="reservation">预留信息</param>
+    /// <param name="actualDataPosition">实际数据位置</param>
+    /// <param name="actualDataSize">实际数据大小</param>
+    public void ConfirmIndex(IndexReservation reservation, long actualDataPosition, int actualDataSize)
+    {
+        lock (_lock)
+        {
+            // 更新索引条目的实际数据位置
+            if (_indexPages.TryGetValue(reservation.PageIndex, out var pageInfo))
+            {
+                var updatedEntry = reservation.IndexEntry;
+                updatedEntry.Position = actualDataPosition; // 设置实际的数据位置
+
+                // 更新索引页中的条目
+                pageInfo.UpdateEntryConfirmed(reservation.Key, updatedEntry);
+                _isDirty = true;
+                UpdateIndexStats();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 回滚索引条目 - 数据写入失败时调用
+    /// </summary>
+    /// <param name="reservation">预留信息</param>
+    public void RollbackIndex(IndexReservation reservation)
+    {
+        lock (_lock)
+        {
+            // 移除预留的索引条目
+            if (_indexPages.TryGetValue(reservation.PageIndex, out var pageInfo))
+            {
+                pageInfo.RemoveEntry(reservation.Key);
+                _isDirty = true;
+                UpdateIndexStats();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 处理Key数据 - 应用压缩和加密
+    /// </summary>
+    /// <param name="key">原始key</param>
+    /// <returns>处理后的key数据</returns>
+    private byte[] ProcessKey(string key)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+
+        // 但如果配置了压缩，我们仍然应用压缩逻辑
+        if (_databaseHeader.CompressionType != CompressionType.None ||
+            _databaseHeader.EncryptionType != EncryptionType.None)
+        {
+            return _dataProcessor.ProcessData(keyBytes);
+        }
+
+        return keyBytes;
+    }
+
+    /// <summary>
+    /// 反处理Key数据 - 解密和解压缩
+    /// </summary>
+    /// <param name="processedKeyData">处理后的key数据</param>
+    /// <returns>原始key字符串</returns>
+    private string UnprocessKey(byte[] processedKeyData)
+    {
+        byte[] keyBytes;
+
+        if (_databaseHeader.CompressionType != CompressionType.None ||
+            _databaseHeader.EncryptionType != EncryptionType.None)
+        {
+            keyBytes = _dataProcessor.UnprocessData(processedKeyData);
+        }
+        else
+        {
+            keyBytes = processedKeyData;
+        }
+
+        return Encoding.UTF8.GetString(keyBytes);
+    }
+
+    /// <summary>
     /// 查找有足够空闲空间的索引页
     /// </summary>
     /// <param name="key">键</param>
     /// <param name="entry">索引条目</param>
+    /// <param name="processedKeyData">处理后的key数据</param>
     /// <returns>可用的页面索引，如果没有则返回null</returns>
-    private uint? FindAvailableIndexPage(string key, IndexEntry entry)
+    private byte? FindAvailableIndexPage(string key, IndexEntry entry, byte[] processedKeyData)
     {
-        var keyBytes = Encoding.UTF8.GetBytes(key);
-        var requiredSpace = IndexEntry.SIZE + keyBytes.Length; // Entry + Key + KeyLength
+        var requiredSpace = IndexEntry.SIZE + processedKeyData.Length; // Entry + ProcessedKey
 
         // 1. 首先检查是否已存在该key，如果存在则直接更新
-        for (uint i = 0; i < _indexHeader.IndexPageCount; i++)
+        for (byte i = 0; i < _indexHeader.IndexPageCount; i++)
         {
             if (_indexPages.TryGetValue(i, out var pageInfo))
             {
@@ -278,7 +428,7 @@ public unsafe class IndexManager : IDisposable
         }
 
         // 2. 查找有足够空闲空间的页面
-        for (uint i = 0; i < _indexHeader.IndexPageCount; i++)
+        for (byte i = 0; i < _indexHeader.IndexPageCount; i++)
         {
             if (_indexPages.TryGetValue(i, out var pageInfo))
             {
@@ -291,7 +441,7 @@ public unsafe class IndexManager : IDisposable
         }
 
         // 3. 尝试压缩现有页面释放空间
-        for (uint i = 0; i < _indexHeader.IndexPageCount; i++)
+        for (byte i = 0; i < _indexHeader.IndexPageCount; i++)
         {
             if (_indexPages.TryGetValue(i, out var pageInfo))
             {
@@ -315,7 +465,7 @@ public unsafe class IndexManager : IDisposable
     /// 创建新的索引页
     /// </summary>
     /// <returns>新创建的页面索引，如果创建失败返回null</returns>
-    private uint? CreateNewIndexPage()
+    private byte? CreateNewIndexPage()
     {
         // 检查是否已达到最大页面数
         if (_indexHeader.IndexPageCount >= IndexHeader.MAX_INDEX_PAGES)
@@ -330,7 +480,7 @@ public unsafe class IndexManager : IDisposable
 
         // 确保页面大小合理
         newPageSize = Math.Max(newPageSize, 1024);           // 最小1KB
-        newPageSize = Math.Min(newPageSize, int.MaxValue); // 最大16MB
+        newPageSize = Math.Min(newPageSize, int.MaxValue); // 最大约2GB
 
         try
         {
@@ -350,13 +500,13 @@ public unsafe class IndexManager : IDisposable
             var block = new IndexBlock(position, newPageSize);
 
             // 创建索引页信息
-            var pageInfo = new IndexPageInfo((int)newPageSize);
+            var pageInfo = new IndexPageInfo((int)newPageSize, _dataProcessor);
 
             // 将空页面写入文件
             SaveIndexPageToFile(pageInfo, block);
 
             // 更新管理信息
-            var newPageIndex = (uint)_indexHeader.IndexPageCount;
+            var newPageIndex = _indexHeader.IndexPageCount;
             _indexBlocks[_indexHeader.IndexPageCount] = block;
             _indexPages.TryAdd(newPageIndex, pageInfo);
 
@@ -494,12 +644,13 @@ public unsafe class IndexManager : IDisposable
             // 确保有足够空间
             EnsureFileSize(position + newPageSize);
 
-            var newPageInfo = new IndexPageInfo((int)newPageSize);
+            var newPageInfo = new IndexPageInfo((int)newPageSize, _dataProcessor);
 
             // 添加所有条目到新页面
             foreach (var kvp in allEntries)
             {
-                newPageInfo.AddOrUpdateEntry(kvp.Key, kvp.Value);
+                var processedKeyData = ProcessKey(kvp.Key);
+                newPageInfo.AddOrUpdateEntry(kvp.Key, kvp.Value, processedKeyData);
             }
 
             // 保存新页面
@@ -531,14 +682,6 @@ public unsafe class IndexManager : IDisposable
     private void SaveIndexPageToFile(IndexPageInfo pageInfo, IndexBlock block)
     {
         var data = pageInfo.GetRawData();
-
-        // 如果启用了压缩/加密，需要压缩/加密数据
-        if (_databaseHeader.CompressionType != CompressionType.None ||
-            _databaseHeader.EncryptionType != EncryptionType.None)
-        {
-            data = _dataProcessor.ProcessData(data);
-        }
-
         _file.Seek(block.Position, SeekOrigin.Begin);
         _file.Write(data);
     }
@@ -570,31 +713,6 @@ public unsafe class IndexManager : IDisposable
 
             _isDirty = false;
         }
-    }
-
-    /// <summary>
-    /// 计算Key的哈希值
-    /// </summary>
-    private uint CalculateKeyHash(string key)
-    {
-        var bytes = Encoding.UTF8.GetBytes(key);
-        uint hash = 2166136261u; // FNV-1a初始值
-
-        foreach (byte b in bytes)
-        {
-            hash ^= b;
-            hash *= 16777619u; // FNV-1a素数
-        }
-
-        return hash;
-    }
-
-    /// <summary>
-    /// 根据哈希值获取页面索引
-    /// </summary>
-    private uint GetPageIndexForHash(uint hash)
-    {
-        return _indexHeader.IndexPageCount > 0 ? hash % (uint)_indexHeader.IndexPageCount : 0;
     }
 
     /// <summary>

@@ -460,7 +460,7 @@ namespace UltraKV
             {
                 try
                 {
-                    Directory.Delete(dataDir, true);
+                    //Directory.Delete(dataDir, true);
                     Thread.Sleep(100); // 等待文件系统释放句柄
                 }
                 catch { }
@@ -471,13 +471,22 @@ namespace UltraKV
             var config = new UltraKVConfig
             {
                 DefaultIndexPageSizeKB = 4, // 默认索引页大小64KB
-                EnableFreeSpaceReuse = false
+                EnableFreeSpaceReuse = false,
+                CompressionType = CompressionType.Gzip,
+                EncryptionType = EncryptionType.AES256GCM,
+                EncryptionKey = "1111111Guid.NewGuid().ToString()",
             };
 
             using var engine = new UltraKVEngine(Path.Combine(dataDir, "test.db"), config);
 
+            var x1 = engine.ContainsKey("user:1001"); // 检查键是否存在
+
             // 添加数据 - 自动更新索引
             engine.Put("user:1001", "John Doe");
+            engine.Flush();
+           
+
+
             engine.Put("user:1002", "Jane Smith");
             engine.Put("order:5001", "Product A");
 
