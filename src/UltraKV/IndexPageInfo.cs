@@ -228,27 +228,35 @@ public unsafe class IndexPageInfo : IDisposable
 
         for (int i = 0; i < header->EntryCount; i++)
         {
-            // 读取IndexEntry
-            var entryPtr = (IndexEntry*)(_pageBuffer + currentOffset);
-            var entry = *entryPtr;
-            var entryOffset = currentOffset;
-            currentOffset += IndexEntry.SIZE;
-
-            // 从IndexEntry中获取Key长度
-            var keyLength = entry.KeyLength;
-
-            // 读取ProcessedKey数据
-            var processedKeyData = new byte[keyLength];
-            fixed (byte* keyPtr = processedKeyData)
+            try
             {
-                Buffer.MemoryCopy(_pageBuffer + currentOffset, keyPtr, keyLength, keyLength);
+                // 读取IndexEntry
+                var entryPtr = (IndexEntry*)(_pageBuffer + currentOffset);
+                var entry = *entryPtr;
+                var entryOffset = currentOffset;
+                currentOffset += IndexEntry.SIZE;
+
+                // 从IndexEntry中获取Key长度
+                var keyLength = entry.KeyLength;
+
+                // 读取ProcessedKey数据
+                var processedKeyData = new byte[keyLength];
+                fixed (byte* keyPtr = processedKeyData)
+                {
+                    Buffer.MemoryCopy(_pageBuffer + currentOffset, keyPtr, keyLength, keyLength);
+                }
+                currentOffset += keyLength;
+
+                var originalKey = UnprocessKey(processedKeyData);
+                if (originalKey == key)
+                {
+                    return entryOffset; // 返回IndexEntry的偏移位置
+                }
             }
-            currentOffset += keyLength;
-
-            var originalKey = UnprocessKey(processedKeyData);
-            if (originalKey == key)
+            catch (Exception ex)
             {
-                return entryOffset; // 返回IndexEntry的偏移位置
+                // 处理异常，可能是数据损坏或格式错误
+                Console.WriteLine($"Error reading entry at offset {currentOffset}: {ex.Message}");
             }
         }
 
