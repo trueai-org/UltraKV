@@ -100,7 +100,11 @@ public unsafe class IndexPageInfo : IDisposable
         lock (_lock)
         {
             var keyBytes = Encoding.UTF8.GetBytes(key);
-            var requiredSpace = IndexEntry.SIZE + keyBytes.Length;
+
+            // 更新IndexEntry中的KeyLength字段
+            entry.KeyLength = keyBytes.Length;
+
+            var requiredSpace = IndexEntry.SIZE + keyBytes.Length; // 只需要IndexEntry + Key数据
 
             var header = (IndexPageHeader*)_pageBuffer;
 
@@ -125,16 +129,15 @@ public unsafe class IndexPageInfo : IDisposable
         }
     }
 
-
     /// <summary>
-    /// 添加新条目
+    /// 添加新条目 - 只写入IndexEntry和Key数据
     /// </summary>
     private void AddNewEntry(byte[] keyBytes, IndexEntry entry)
     {
         var header = (IndexPageHeader*)_pageBuffer;
         var writeOffset = header->UsedSpace;
 
-        // 写入IndexEntry
+        // 写入IndexEntry（包含KeyLength信息）
         var entryPtr = (IndexEntry*)(_pageBuffer + writeOffset);
         *entryPtr = entry;
         writeOffset += IndexEntry.SIZE;
@@ -202,7 +205,7 @@ public unsafe class IndexPageInfo : IDisposable
     }
 
     /// <summary>
-    /// 查找条目在页面中的偏移位置
+    /// 查找条目在页面中的偏移位置 - 使用IndexEntry中的KeyLength
     /// </summary>
     private int FindEntryOffset(string key)
     {
@@ -211,14 +214,14 @@ public unsafe class IndexPageInfo : IDisposable
 
         for (int i = 0; i < header->EntryCount; i++)
         {
-            // 读取Key长度
-            var keyLengthPtr = (int*)(_pageBuffer + currentOffset);
-            var keyLength = *keyLengthPtr;
-            currentOffset += sizeof(int);
-
             // 读取IndexEntry
             var entryPtr = (IndexEntry*)(_pageBuffer + currentOffset);
+            var entry = *entryPtr;
+            var entryOffset = currentOffset;
             currentOffset += IndexEntry.SIZE;
+
+            // 从IndexEntry中获取Key长度
+            var keyLength = entry.KeyLength;
 
             // 读取Key数据
             var keyData = new string((sbyte*)(_pageBuffer + currentOffset), 0, keyLength, Encoding.UTF8);
@@ -227,7 +230,7 @@ public unsafe class IndexPageInfo : IDisposable
             // 比较Key
             if (keyData == key)
             {
-                return (int)((byte*)entryPtr - _pageBuffer);
+                return entryOffset; // 返回IndexEntry的偏移位置
             }
         }
 
@@ -243,10 +246,8 @@ public unsafe class IndexPageInfo : IDisposable
         *entryPtr = newEntry;
 
         _isDirty = true;
-
         UpdateHeader();
     }
-
 
     /// <summary>
     /// 更新页面头部
@@ -258,7 +259,7 @@ public unsafe class IndexPageInfo : IDisposable
     }
 
     /// <summary>
-    /// 获取所有有效条目
+    /// 获取所有有效条目 - 使用IndexEntry中的KeyLength
     /// </summary>
     public IEnumerable<KeyValuePair<string, IndexEntry>> GetAllEntries()
     {
@@ -270,13 +271,12 @@ public unsafe class IndexPageInfo : IDisposable
 
             for (int i = 0; i < header->EntryCount; i++)
             {
-                // 读取Key长度
-                var keyLength = *(int*)(_pageBuffer + currentOffset);
-                currentOffset += sizeof(int);
-
                 // 读取IndexEntry
                 var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
                 currentOffset += IndexEntry.SIZE;
+
+                // 从IndexEntry中获取Key长度
+                var keyLength = entry.KeyLength;
 
                 // 读取Key数据
                 var keyData = new string((sbyte*)(_pageBuffer + currentOffset), 0, keyLength, Encoding.UTF8);
@@ -294,7 +294,7 @@ public unsafe class IndexPageInfo : IDisposable
     }
 
     /// <summary>
-    /// 获取统计信息
+    /// 获取统计信息 - 使用IndexEntry中的KeyLength
     /// </summary>
     public (int TotalEntries, int ActiveEntries, int DeletedEntries, int UsedSpace, int FreeSpace) GetStats()
     {
@@ -307,11 +307,13 @@ public unsafe class IndexPageInfo : IDisposable
 
             for (int i = 0; i < header->EntryCount; i++)
             {
-                var keyLength = *(int*)(_pageBuffer + currentOffset);
-                currentOffset += sizeof(int);
-
+                // 读取IndexEntry
                 var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
-                currentOffset += IndexEntry.SIZE + keyLength;
+                currentOffset += IndexEntry.SIZE;
+
+                // 从IndexEntry中获取Key长度
+                var keyLength = entry.KeyLength;
+                currentOffset += keyLength;
 
                 if (entry.IsValidEntry)
                     activeEntries++;
@@ -349,7 +351,7 @@ public unsafe class IndexPageInfo : IDisposable
     }
 
     /// <summary>
-    /// 压缩页面，移除已删除的条目
+    /// 压缩页面，移除已删除的条目 - 使用IndexEntry中的KeyLength
     /// </summary>
     public void CompactPage()
     {
@@ -377,22 +379,25 @@ public unsafe class IndexPageInfo : IDisposable
                 // 复制有效条目
                 for (int i = 0; i < header->EntryCount; i++)
                 {
-                    var keyLength = *(int*)(_pageBuffer + currentOffset);
-                    var entryOffset = currentOffset + sizeof(int);
-                    var entry = *(IndexEntry*)(_pageBuffer + entryOffset);
-                    var keyOffset = entryOffset + IndexEntry.SIZE;
+                    // 读取IndexEntry
+                    var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
+                    var entryStartOffset = currentOffset;
+                    currentOffset += IndexEntry.SIZE;
+
+                    // 从IndexEntry中获取Key长度
+                    var keyLength = entry.KeyLength;
 
                     if (entry.IsValidEntry)
                     {
-                        // 复制到临时缓冲区
-                        var entrySize = sizeof(int) + IndexEntry.SIZE + keyLength;
-                        Buffer.MemoryCopy(_pageBuffer + currentOffset, tempBuffer + writeOffset, entrySize, entrySize);
+                        // 复制IndexEntry + Key数据到临时缓冲区
+                        var entrySize = IndexEntry.SIZE + keyLength;
+                        Buffer.MemoryCopy(_pageBuffer + entryStartOffset, tempBuffer + writeOffset, entrySize, entrySize);
 
                         writeOffset += entrySize;
                         tempHeader->EntryCount++;
                     }
 
-                    currentOffset += sizeof(int) + IndexEntry.SIZE + keyLength;
+                    currentOffset += keyLength;
                 }
 
                 // 更新临时头部
@@ -412,22 +417,8 @@ public unsafe class IndexPageInfo : IDisposable
         }
     }
 
-    private uint CalculateKeyHash(string key)
-    {
-        var bytes = Encoding.UTF8.GetBytes(key);
-        uint hash = 2166136261u; // FNV-1a初始值
-
-        foreach (byte b in bytes)
-        {
-            hash ^= b;
-            hash *= 16777619u; // FNV-1a素数
-        }
-
-        return hash;
-    }
-
     /// <summary>
-    /// 检查页面是否包含指定的key
+    /// 检查页面是否包含指定的key - 使用IndexEntry中的KeyLength
     /// </summary>
     public bool ContainsKey(string key)
     {
@@ -441,11 +432,12 @@ public unsafe class IndexPageInfo : IDisposable
 
             for (int i = 0; i < header->EntryCount; i++)
             {
-                // 读取Key长度
-                var keyLength = *(int*)(_pageBuffer + currentOffset);
-
-                // 跳过IndexEntry
+                // 读取IndexEntry
+                var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
                 currentOffset += IndexEntry.SIZE;
+
+                // 从IndexEntry中获取Key长度
+                var keyLength = entry.KeyLength;
 
                 // 读取Key数据并比较
                 var keyData = new string((sbyte*)(_pageBuffer + currentOffset), 0, keyLength, Encoding.UTF8);
