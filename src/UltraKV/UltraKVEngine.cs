@@ -10,7 +10,6 @@ public unsafe class UltraKVEngine : IDisposable
     private readonly FreeSpaceManager _freeSpaceManager;
     private readonly IndexManager _indexManager; // 新增索引管理器
     private readonly DataProcessor _dataProcessor;
-    private readonly ConcurrentDictionary<string, long> _keyIndex;
     private readonly DatabaseHeader _databaseHeader;
     private readonly UltraKVConfig _config;
     private readonly object _writeLock = new object();
@@ -96,7 +95,6 @@ public unsafe class UltraKVEngine : IDisposable
 
             // 传递 EnableFreeSpaceReuse 配置到 FreeSpaceManager
             var freeSpaceManager = new FreeSpaceManager(_file, _databaseHeader.FreeSpaceRegionSizeKB * 1024, _config.EnableFreeSpaceReuse);
-            
 
             // 如果需要重建
             // 重建后是没有空闲空间的
@@ -127,12 +125,10 @@ public unsafe class UltraKVEngine : IDisposable
             var firstIndexDataStartPosition = freeSpaceManager.GetFirstIndexDataStartPosition();
             _indexManager = new IndexManager(_file, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
 
-
             _freeSpaceManager = freeSpaceManager;
         }
 
-
-        _keyIndex = new ConcurrentDictionary<string, long>();
+        //_keyIndex = new ConcurrentDictionary<string, long>();
 
         if (!isNewFile)
         {
@@ -374,94 +370,55 @@ public unsafe class UltraKVEngine : IDisposable
 
         ValidateKey(key);
 
-        using var record = new Record(key, value);
-        var rawData = record.GetRawData();
+        var valueBytes = Encoding.UTF8.GetBytes(value);
 
         lock (_writeLock)
         {
-            // 如果键已存在，标记旧记录为删除
-            if (_keyIndex.TryGetValue(key, out var oldPosition))
+            // 首先预留索引位置（但不指定数据位置）
+            var indexReservation = _indexManager.AddOrUpdateIndex(key);
+            if (indexReservation == null)
             {
-                MarkAsDeleted(oldPosition);
-
-                // 不需要删除
-                //_indexManager.RemoveIndex(key); // 更新索引
+                throw new InvalidOperationException("Failed to reserve index position");
             }
 
-            // 首先更新索引位置
-            // 更新索引
-            _indexManager.AddOrUpdateIndex(key);
-
             long position;
+            IndexEntry indexEntry = indexReservation.IndexEntry;
 
+            byte[] processedData;
             if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
             {
                 // 加密/压缩模式
-                var processedData = _dataProcessor.ProcessData(rawData);
-
-                var encryptedHeader = new EncryptedDataHeader
-                {
-                    OriginalSize = (uint)rawData.Length,
-                    EncryptedSize = (uint)processedData.Length,
-                    IsDeleted = 0,
-                    Reserved1 = 0,
-                    Reserved2 = 0
-                };
-
-                var totalSize = EncryptedDataHeader.SIZE + processedData.Length;
-                var multipliedSize = (int)(totalSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
-
-                if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
-                {
-                    position = freeBlock.Position;
-                    var remainingSize = freeBlock.Size - totalSize;
-                    if (remainingSize > 64)
-                    {
-                        _freeSpaceManager.AddFreeSpace(position + totalSize, remainingSize);
-                    }
-                }
-                else
-                {
-                    position = _file.Length;
-                    _file.SetLength(position + multipliedSize);
-                }
-
-                _file.Seek(position, SeekOrigin.Begin);
-                var headerBytes = new byte[EncryptedDataHeader.SIZE];
-                fixed (byte* headerPtr = headerBytes)
-                {
-                    *(EncryptedDataHeader*)headerPtr = encryptedHeader;
-                }
-                _file.Write(headerBytes, 0, EncryptedDataHeader.SIZE);
-                _file.Write(processedData);
+                processedData = _dataProcessor.ProcessData(valueBytes);
             }
             else
             {
-                // 非加密模式
-                var requiredSize = rawData.Length;
-                var multipliedSize = (int)(requiredSize * (1 + _databaseHeader.AllocationMultiplier / 100.0));
-
-                if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
-                {
-                    position = freeBlock.Position;
-                    var remainingSize = freeBlock.Size - requiredSize;
-                    if (remainingSize > 64)
-                    {
-                        _freeSpaceManager.AddFreeSpace(position + requiredSize, remainingSize);
-                    }
-                }
-                else
-                {
-                    position = _file.Length;
-                    _file.SetLength(position + multipliedSize);
-                }
-
-                _file.Seek(position, SeekOrigin.Begin);
-                _file.Write(rawData);
+                processedData = valueBytes;
             }
 
+            var multipliedSize = (int)(processedData.Length * _databaseHeader.GetActualAllocationMultiplier());
+
+            indexEntry.ValueLength = processedData.Length;
+
+            if (_freeSpaceManager.TryGetFreeSpace(multipliedSize, out var freeBlock))
+            {
+                position = freeBlock.Position;
+                indexEntry.ValuePosition = freeBlock.Position;
+                indexEntry.ValueAllocatedSize = (int)freeBlock.Size;
+            }
+            else
+            {
+                position = _file.Length;
+                indexEntry.ValuePosition = position;
+                indexEntry.ValueAllocatedSize = multipliedSize;
+                _file.SetLength(position + multipliedSize);
+            }
+
+            _file.Seek(position, SeekOrigin.Begin);
+            _file.Write(processedData);
+
+            _indexManager.ConfirmIndex(key, indexEntry);
+
             _file.Flush();
-            _keyIndex[key] = position;
 
             if (_enableUpdateValidation)
             {
@@ -469,7 +426,6 @@ public unsafe class UltraKVEngine : IDisposable
             }
         }
     }
-
 
     public string? Get(string key)
     {
@@ -480,9 +436,7 @@ public unsafe class UltraKVEngine : IDisposable
         var position = _indexManager.FindIndex(key);
         if (position == -1)
         {
-            // 索引中没有找到，尝试从内存索引查找
-            if (!_keyIndex.TryGetValue(key, out position))
-                return null;
+            return null;
         }
 
         try
@@ -501,7 +455,6 @@ public unsafe class UltraKVEngine : IDisposable
                     var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
                     if (encryptedHeader.IsDeleted != 0)
                     {
-                        _keyIndex.TryRemove(key, out _);
                         _indexManager.RemoveIndex(key);
                         return null;
                     }
@@ -530,8 +483,7 @@ public unsafe class UltraKVEngine : IDisposable
                 {
                     var header = *(RecordHeader*)headerPtr;
                     if (header.IsDeleted != 0)
-                    {
-                        _keyIndex.TryRemove(key, out _);
+                    {;
                         _indexManager.RemoveIndex(key);
                         return null;
                     }
@@ -563,39 +515,27 @@ public unsafe class UltraKVEngine : IDisposable
 
     public bool Delete(string key)
     {
-        if (string.IsNullOrEmpty(key) || !_keyIndex.TryGetValue(key, out var position))
+        if (string.IsNullOrEmpty(key) || !_indexManager.TryGetValue(key, out var position))
             return false;
 
         lock (_writeLock)
         {
             MarkAsDeleted(position);
-            _keyIndex.TryRemove(key, out _);
+            _indexManager.TryRemove(key, out _);
             _indexManager.RemoveIndex(key); // 更新索引
             return true;
         }
     }
 
+    /// <summary>
+    /// 标记删除
+    /// </summary>
+    /// <param name="position"></param>
     private void MarkAsDeleted(long position)
     {
-        try
-        {
-            if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
-            {
-                // 加密模式：标记EncryptedDataHeader的IsDeleted字段
-                _file.Seek(position + 8, SeekOrigin.Begin); // 跳到IsDeleted字段 (OriginalSize(4) + EncryptedSize(4))
-                _file.WriteByte(1);
-            }
-            else
-            {
-                // 非加密模式：标记RecordHeader的IsDeleted字段
-                _file.Seek(position + 16, SeekOrigin.Begin); // 跳到IsDeleted字段
-                _file.WriteByte(1);
-            }
-        }
-        catch
-        {
-            // 忽略错误
-        }
+        // IndexEntry 第一个位置删除标志
+        _file.Seek(position, SeekOrigin.Begin);
+        _file.WriteByte(1);
     }
 
     private void LoadIndex()
@@ -634,7 +574,6 @@ public unsafe class UltraKVEngine : IDisposable
                                     {
                                         var record = new Record(dataPtr, processedData.Length);
                                         var key = record.GetKey();
-                                        _keyIndex[key] = position;
                                         _indexManager.AddOrUpdateIndex(key); // 重建索引
                                     }
                                 }
@@ -674,7 +613,7 @@ public unsafe class UltraKVEngine : IDisposable
                                 {
                                     var record = new Record(dataPtr, recordData.Length);
                                     var key = record.GetKey();
-                                    _keyIndex[key] = position;
+
                                     _indexManager.AddOrUpdateIndex(key); // 重建索引
                                 }
                             }
@@ -704,37 +643,19 @@ public unsafe class UltraKVEngine : IDisposable
         if (string.IsNullOrEmpty(key))
             return false;
 
-        if (!_keyIndex.ContainsKey(key))
-            return false;
-
-        if (_keyIndex.TryGetValue(key, out var position))
+        if (_indexManager.TryGetValue(key, out var position))
         {
-            try
+            // IndexEntry 第一个位置删除标志
+            _file.Seek(position, SeekOrigin.Begin); // EncryptedDataHeader.IsDeleted位置
+
+            var isDeleted = _file.ReadByte();
+            if (isDeleted == 1)
             {
-                if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
-                {
-                    _file.Seek(position + 8, SeekOrigin.Begin); // EncryptedDataHeader.IsDeleted位置
-                }
-                else
-                {
-                    _file.Seek(position + 16, SeekOrigin.Begin); // RecordHeader.IsDeleted位置
-                }
-
-                var isDeleted = _file.ReadByte();
-
-                if (isDeleted == 1)
-                {
-                    _keyIndex.TryRemove(key, out _);
-                    return false;
-                }
-
-                return true;
-            }
-            catch
-            {
-                _keyIndex.TryRemove(key, out _);
+                _indexManager.TryRemove(key, out _);
                 return false;
             }
+
+            return true;
         }
 
         return false;
@@ -752,10 +673,10 @@ public unsafe class UltraKVEngine : IDisposable
         {
             foreach (var key in keysToDelete)
             {
-                if (_keyIndex.TryGetValue(key, out var position))
+                if (_indexManager.TryGetValue(key, out var position))
                 {
                     MarkAsDeleted(position);
-                    _keyIndex.TryRemove(key, out _);
+                    _indexManager.TryRemove(key, out _);
                     deletedCount++;
                 }
             }
@@ -768,7 +689,7 @@ public unsafe class UltraKVEngine : IDisposable
     {
         lock (_writeLock)
         {
-            _keyIndex.Clear();
+            _indexManager.Clear();
             var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
             _file.SetLength(dataStartPosition);
             _freeSpaceManager.Clear();
@@ -781,9 +702,12 @@ public unsafe class UltraKVEngine : IDisposable
         lock (_writeLock)
         {
             _file.Flush();
+
+            // 保存空闲空间头部信息
             _freeSpaceManager.SaveFreeSpaceRegion();
 
-            _indexManager.SaveChanges(); // 保存索引更改
+            // 保存索引更改
+            _indexManager.SaveChanges();
         }
     }
 
@@ -817,8 +741,8 @@ public unsafe class UltraKVEngine : IDisposable
                     NewFileSize = _file.Length,
                     SpaceSaved = 0,
                     SpaceSavedPercentage = 0,
-                    ValidRecords = _keyIndex.Count,
-                    TotalRecordsProcessed = _keyIndex.Count,
+                    ValidRecords = _indexManager.GetStats().ActiveEntries,
+                    TotalRecordsProcessed = _indexManager.GetStats().TotalEntries,
                     ElapsedMilliseconds = 0
                 };
             }
@@ -865,6 +789,15 @@ public unsafe class UltraKVEngine : IDisposable
                     // 创建新的空闲空间区域
                     tempFreeSpaceManager.CreateNewFreeSpaceRegion();
                 }
+
+                // 初始化数据处理器
+                var dataProcessor = new DataProcessor(_databaseHeader, _config.EncryptionKey);
+
+                // 初始化索引管理器
+                var firstIndexDataStartPosition = tempFreeSpaceManager.GetFirstIndexDataStartPosition();
+                var indexManager = new IndexManager(_file, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
+
+                indexManager.MergeIndexesToTargetFile(tempFile, firstIndexDataStartPosition);
 
                 var newKeyIndex = new ConcurrentDictionary<string, long>();
                 var currentPosition = tempFreeSpaceManager.GetDataStartPosition();
@@ -1161,7 +1094,7 @@ public unsafe class UltraKVEngine : IDisposable
 
     public IEnumerable<string> GetAllKeys()
     {
-        return _keyIndex.Keys.ToList();
+        return _indexManager.IndexEntrys.Keys;
     }
 
     public DatabaseInfo GetDatabaseInfo()
@@ -1170,7 +1103,7 @@ public unsafe class UltraKVEngine : IDisposable
         return new DatabaseInfo
         {
             Header = _databaseHeader,
-            KeyCount = _keyIndex.Count,
+            KeyCount = _indexManager.GetStats().ActiveEntries,
             FileSize = _file.Length,
             FreeSpaceStats = stats
         };
@@ -1249,7 +1182,6 @@ public unsafe class UltraKVEngine : IDisposable
             _disposed = true;
         }
     }
-
 
     /// <summary>
     /// 合并索引 - 将所有索引页合并到第一个索引页

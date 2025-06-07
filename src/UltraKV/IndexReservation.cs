@@ -3,7 +3,7 @@
 /// <summary>
 /// 索引预留信息
 /// </summary>
-public struct IndexReservation
+public class IndexReservation
 {
     public string Key;
     public long DataPosition;
@@ -20,9 +20,9 @@ public struct IndexReservation
         ReservationTime = DateTime.UtcNow;
     }
 
-    public readonly bool IsValid => !string.IsNullOrEmpty(Key) && DataPosition >= 0;
+    public bool IsValid => !string.IsNullOrEmpty(Key) && DataPosition >= 0;
 
-    public override readonly string ToString()
+    public override string ToString()
     {
         return $"IndexReservation: Key={Key}, DataPos={DataPosition}, PageIndex={PageIndex}";
     }

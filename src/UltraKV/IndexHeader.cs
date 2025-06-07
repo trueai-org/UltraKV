@@ -29,23 +29,25 @@ public struct IndexBlock
 }
 
 /// <summary>
-/// 索引页内的单个索引条目 - 固定16字节
+/// 索引页内的单个索引条目 - 固定32字节
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct IndexEntry
 {
-    public long Position;           // 8 bytes - 值数据在文件中的位置
-    public int KeyLength;           // 4 bytes - Key长度
     public byte IsDeleted;          // 1 byte - 删除标记
     public byte PageIndex;          // 1 byte - 所在索引页的索引
-                                    // Total: 14 bytes
+    public int KeyLength;           // 4 bytes - Key长度
+    public long ValuePosition;      // 8 bytes - 值数据在文件中的位置，默认：-1，表示未分配
+    public int ValueLength;         // 4 bytes - 值数据真实长度（压缩/加密后）
+    public int ValueAllocatedSize;  // 4 bytes - 值分配空间长度（默认：1.2 倍，用于重写和覆盖）
+    public long Timestamp;          // 8 bytes - 时间戳
+                                    // Total: 30 bytes
 
+    public const int SIZE = 32;
 
-    public const int SIZE = 16;
-
-    public IndexEntry(long position, int keyLength, bool isDeleted = false)
+    public IndexEntry(int keyLength, bool isDeleted = false)
     {
-        Position = position;
+        ValuePosition = -1;
         KeyLength = keyLength;
         IsDeleted = isDeleted ? (byte)1 : (byte)0;
         PageIndex = 0;
@@ -57,13 +59,19 @@ public struct IndexEntry
     public bool IsValidEntry => KeyLength > 0 && IsDeleted == 0;
 
     /// <summary>
-    /// 
+    /// 验证索引条目是否有效，包括 KeyLength 和 ValuePosition
     /// </summary>
-    public bool IsValidEntryValue => IsValidEntry && Position >= 0;
+    public bool IsValidEntryValue => IsValidEntry && ValuePosition >= 0;
 
     public override string ToString()
     {
-        return $"IndexEntry: Pos={Position}, KeyLen={KeyLength}, Deleted={IsDeleted}";
+        return $"IndexEntry: Page={PageIndex}, " +
+               $"KeyLen={KeyLength}, " +
+               $"ValuePosition: Pos={ValuePosition}, " +
+               $"ValueLen={ValueLength}, " +
+               $"ValueAllocSize={ValueAllocatedSize}, " +
+               $"Deleted={IsDeleted}, " +
+               $"Timestamp={Timestamp}";
     }
 }
 
@@ -82,7 +90,7 @@ public struct IndexHeader
                                             // total = 23 bytes
 
     public long CreatedTime;                // 8 bytes - 创建时间
-    public long LastRebuildTime;            // 8 bytes - 最后重建时间  
+    public long LastRebuildTime;            // 8 bytes - 最后重建时间
     public uint TotalIndexEntries;          // 4 bytes - 总索引条目数
     public uint ActiveIndexEntries;         // 4 bytes - 活跃索引条目数
     public uint DeletedIndexEntries;        // 4 bytes - 已删除索引条目数
@@ -123,7 +131,6 @@ public struct IndexHeader
     public readonly bool IsValid => Magic == MAGIC_NUMBER &&
                                    Version <= CURRENT_VERSION &&
                                    IndexPageCount <= MaxIndexPages;
-
 
     public void UpdateStats(uint totalEntries, uint activeEntries, uint deletedEntries)
     {

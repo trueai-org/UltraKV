@@ -37,7 +37,7 @@ public unsafe class IndexManager : IDisposable
     /// <summary>
     /// 记录 key 和 keyEntry 的映射关系
     /// </summary>
-    private readonly ConcurrentDictionary<string, IndexEntry> _keyToEntryMap;
+    private readonly ConcurrentDictionary<string, IndexEntry> _indexEntrys;
 
     public IndexManager(FileStream file, DatabaseHeader databaseHeader, DataProcessor dataProcessor, long firstIndexDataStartPosition)
     {
@@ -47,12 +47,17 @@ public unsafe class IndexManager : IDisposable
         _dataProcessor = dataProcessor;
         _indexBlocks = new IndexBlock[IndexHeader.MAX_INDEX_PAGES];
         _indexPages = new ConcurrentDictionary<uint, IndexPageInfo>();
-        _keyToEntryMap = new ConcurrentDictionary<string, IndexEntry>();
+        _indexEntrys = new ConcurrentDictionary<string, IndexEntry>();
 
         LoadIndexHeader();
         LoadIndexBlocks();
         LoadIndexPages();
     }
+
+    /// <summary>
+    /// 所有索引信息
+    /// </summary>
+    public ConcurrentDictionary<string, IndexEntry> IndexEntrys => _indexEntrys;
 
     /// <summary>
     /// 加载索引头信息
@@ -169,7 +174,7 @@ public unsafe class IndexManager : IDisposable
                 foreach (var item in kvs)
                 {
                     // 将key和条目信息添加到映射中
-                    _keyToEntryMap.TryAdd(item.Key, item.Value);
+                    _indexEntrys.TryAdd(item.Key, item.Value);
                 }
             }
         }
@@ -240,106 +245,82 @@ public unsafe class IndexManager : IDisposable
 
         lock (_lock)
         {
-            try
+            if (_indexEntrys.TryGetValue(key, out var v) && v.IsValidEntry)
             {
-                if (_keyToEntryMap.TryGetValue(key, out var v) && v.IsValidEntry)
-                {
-                    // Key已存在，直接返回现有的索引信息
-                    return new IndexReservation
-                    {
-                        Key = key,
-                        DataPosition = v.Position, // 使用现有位置
-                        IndexEntry = v,
-                        PageIndex = v.PageIndex,
-                        ReservationTime = DateTime.UtcNow,
-                    };
-                }
+                // Key已存在，直接返回现有的索引信息
+                return new IndexReservation(key, v.ValuePosition, v, v.PageIndex);
+            }
 
-                //// 1. 首先检查key是否已经存在（基于原始key，而非加密内容）
-                //var existingEntry = FindExistingIndexEntry(key);
-                //if (existingEntry.HasValue)
-                //{
-                //    // Key已存在，只需要返回现有的索引信息，不需要更新加密内容
-                //    return new IndexReservation
-                //    {
-                //        Key = key,
-                //        DataPosition = existingEntry.Value.Entry.Position, // 使用现有位置
-                //        IndexEntry = existingEntry.Value.Entry,
-                //        PageIndex = existingEntry.Value.PageIndex,
-                //        ReservationTime = DateTime.UtcNow,
-                //    };
-                //}
+            //// 1. 首先检查key是否已经存在（基于原始key，而非加密内容）
+            //var existingEntry = FindExistingIndexEntry(key);
+            //if (existingEntry.HasValue)
+            //{
+            //    // Key已存在，只需要返回现有的索引信息，不需要更新加密内容
+            //    return new IndexReservation
+            //    {
+            //        Key = key,
+            //        DataPosition = existingEntry.Value.Entry.Position, // 使用现有位置
+            //        IndexEntry = existingEntry.Value.Entry,
+            //        PageIndex = existingEntry.Value.PageIndex,
+            //        ReservationTime = DateTime.UtcNow,
+            //    };
+            //}
 
-                // 处理key（可能需要加密/压缩）
-                var processedKeyData = ProcessKey(key);
+            // 处理key（可能需要加密/压缩）
+            var processedKeyData = ProcessKey(key);
 
-                // 创建索引条目，值位置暂时设为-1（未分配）
-                var entry = new IndexEntry(-1, processedKeyData.Length);
+            // 创建索引条目，值位置暂时设为-1（未分配）
+            var entry = new IndexEntry(processedKeyData.Length);
 
-                // 查找有空闲空间的索引页
-                var pageIndex = FindAvailableIndexPage(key, entry, processedKeyData);
+            // 查找有空闲空间的索引页
+            var pageIndex = FindAvailableIndexPage(key, entry, processedKeyData);
+            if (pageIndex == null)
+            {
+                // 没有可用页面，创建新的索引页
+                pageIndex = CreateNewIndexPage();
                 if (pageIndex == null)
                 {
-                    // 没有可用页面，创建新的索引页
-                    pageIndex = CreateNewIndexPage();
-                    if (pageIndex == null)
-                    {
-                        return null; // 创建失败
-                    }
+                    return null; // 创建失败
                 }
-
-                // 在找到的索引页中写入索引信息和key值
-                if (_indexPages.TryGetValue(pageIndex.Value, out var pageInfo))
-                {
-                    entry.PageIndex = pageIndex.Value;
-                    if (pageInfo.AddOrUpdateEntry(key, entry, processedKeyData))
-                    {
-                        _isDirty = true;
-                        UpdateIndexStats();
-
-                        _keyToEntryMap.AddOrUpdate(key, entry, (k, v) => entry);
-
-                        // 返回预留信息
-                        return new IndexReservation
-                        {
-                            Key = key,
-                            DataPosition = -1,  // 稍后在确认时设置实际位置
-                            IndexEntry = entry,
-                            PageIndex = pageIndex.Value,
-                            ReservationTime = DateTime.UtcNow
-                        };
-                    }
-                }
-
-                return null;
             }
-            catch (Exception ex)
+
+            // 在找到的索引页中写入索引信息和key值
+            if (_indexPages.TryGetValue(pageIndex.Value, out var pageInfo))
             {
-                Console.WriteLine($"Error adding index for key '{key}': {ex.Message}");
-                return null;
+                entry.PageIndex = pageIndex.Value;
+                if (pageInfo.AddOrUpdateEntry(key, entry, processedKeyData))
+                {
+                    _isDirty = true;
+                    UpdateIndexStats();
+
+                    _indexEntrys.AddOrUpdate(key, entry, (k, v) => entry);
+
+                    // 返回预留信息
+                    return new IndexReservation(key, -1, entry, pageIndex.Value);
+                }
             }
+
+            return null;
         }
     }
 
     /// <summary>
     /// 确认索引条目 - 数据写入成功后更新实际的数据位置
     /// </summary>
-    /// <param name="reservation">预留信息</param>
-    /// <param name="actualDataPosition">实际数据位置</param>
-    /// <param name="actualDataSize">实际数据大小</param>
-    public void ConfirmIndex(IndexReservation reservation, long actualDataPosition, int actualDataSize)
+    /// <param name="updatedEntry">索引信息</param>
+    public void ConfirmIndex(string key, IndexEntry updatedEntry)
     {
         lock (_lock)
         {
             // 更新索引条目的实际数据位置
-            if (_indexPages.TryGetValue(reservation.PageIndex, out var pageInfo))
+            if (_indexPages.TryGetValue(updatedEntry.PageIndex, out var pageInfo))
             {
-                var updatedEntry = reservation.IndexEntry;
-                updatedEntry.Position = actualDataPosition; // 设置实际的数据位置
-
                 // 更新索引页中的条目
-                pageInfo.UpdateEntryConfirmed(reservation.Key, updatedEntry);
+                updatedEntry.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                pageInfo.UpdateEntryConfirmed(key, updatedEntry);
+
                 _isDirty = true;
+
                 UpdateIndexStats();
             }
         }
@@ -541,6 +522,12 @@ public unsafe class IndexManager : IDisposable
         if (string.IsNullOrEmpty(key))
             return -1;
 
+        // 如果key已存在，直接返回其位置
+        if (_indexEntrys.TryGetValue(key, out var v))
+        {
+            return v.IsValidEntryValue ? v.ValuePosition : -1;
+        }
+
         lock (_lock)
         {
             // 遍历所有索引页查找key
@@ -558,6 +545,18 @@ public unsafe class IndexManager : IDisposable
 
             return -1; // 未找到
         }
+    }
+
+    /// <summary>
+    /// 尝试获取索引条目位置
+    /// </summary>
+    /// <param name="key"></param>
+    /// <returns></returns>
+    public bool TryGetValue(string key, out long position)
+    {
+        position = FindIndex(key);
+
+        return position >= 0;
     }
 
     /// <summary>
@@ -733,16 +732,16 @@ public unsafe class IndexManager : IDisposable
     {
         lock (_lock)
         {
-            uint totalEntries = 0;
-            uint activeEntries = 0;
-            uint deletedEntries = 0;
+            int totalEntries = 0;
+            int activeEntries = 0;
+            int deletedEntries = 0;
 
             foreach (var pageInfo in _indexPages.Values)
             {
                 var stats = pageInfo.GetStats();
-                totalEntries += (uint)stats.TotalEntries;
-                activeEntries += (uint)stats.ActiveEntries;
-                deletedEntries += (uint)stats.DeletedEntries;
+                totalEntries += stats.TotalEntries;
+                activeEntries += stats.ActiveEntries;
+                deletedEntries += stats.DeletedEntries;
             }
 
             return new IndexStats
@@ -774,6 +773,296 @@ public unsafe class IndexManager : IDisposable
             _disposed = true;
         }
     }
+
+    /// <summary>
+    /// 尝试从索引中移除条目
+    /// </summary>
+    /// <param name="key"></param>
+    internal void TryRemove(string key, out long position)
+    {
+        position = -1;
+        if (string.IsNullOrEmpty(key))
+            return;
+
+        lock (_lock)
+        {
+            // 尝试从映射中移除
+            if (_indexEntrys.TryRemove(key, out var entry))
+            {
+                position = entry.ValuePosition;
+
+                RemoveIndex(key);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 清除所有索引数据
+    /// </summary>
+    /// <exception cref="NotImplementedException"></exception>
+    internal void Clear()
+    {
+        lock (_lock)
+        {
+            // 清空索引页和索引块
+            _indexPages.Clear();
+
+            Array.Clear(_indexBlocks, 0, _indexBlocks.Length);
+
+            _indexHeader.IndexPageCount = 0;
+            _indexHeader.TotalIndexSize = 0;
+            _indexHeader.IndexRegionStartPos = 0;
+
+            // 清空映射
+            _indexEntrys.Clear();
+
+            // 标记为脏数据
+            _isDirty = true;
+
+            // 保存更改
+            SaveChanges();
+        }
+    }
+
+    // ---------------
+
+
+
+    /// <summary>
+    /// 将当前 IndexManager 的所有索引合并到目标文件的第一个索引分区
+    /// </summary>
+    /// <param name="targetFile">目标文件流</param>
+    /// <param name="targetFirstIndexDataPosition">目标文件第一个索引数据区域起始位置</param>
+    /// <returns>合并操作是否成功</returns>
+    public bool MergeIndexesToTargetFile(FileStream targetFile, long targetFirstIndexDataPosition)
+    {
+        if (targetFile == null)
+            throw new ArgumentNullException(nameof(targetFile));
+
+        lock (_lock)
+        {
+            try
+            {
+                Console.WriteLine("Starting simplified index merge operation...");
+
+                // 1. 收集所有索引条目数据
+                var allIndexData = new List<byte[]>();
+                var allEntries = new List<KeyValuePair<string, IndexEntry>>();
+                long totalDataSize = IndexPageHeader.SIZE;
+
+
+                //// 1. 收集当前所有索引条目
+                //var allIndexEntries = new Dictionary<string, IndexEntry>();
+
+                //// 优先从内存映射获取
+                //foreach (var kvp in _indexEntrys)
+                //{
+                //    if (kvp.Value.IsValidEntryValue)
+                //    {
+                //        allIndexEntries[kvp.Key] = kvp.Value;
+                //    }
+                //}
+
+                //// 如果内存映射为空，从索引页中获取
+                //if (allIndexEntries.Count == 0)
+                //{
+                //    foreach (var pageInfo in _indexPages.Values)
+                //    {
+                //        foreach (var kvp in pageInfo.GetAllEntries())
+                //        {
+                //            if (kvp.Value.IsValidEntryValue)
+                //            {
+                //                allIndexEntries[kvp.Key] = kvp.Value;
+                //            }
+                //        }
+                //    }
+                //}
+
+                // 遍历所有索引页收集数据
+                for (uint i = 0; i < _indexHeader.IndexPageCount; i++)
+                {
+                    if (_indexPages.TryGetValue(i, out var pageInfo))
+                    {
+                        foreach (var kvp in pageInfo.GetAllEntries())
+                        {
+                            if (kvp.Value.IsValidEntryValue)
+                            {
+                                // 获取处理后的key数据
+                                var processedKeyData = ProcessKey(kvp.Key);
+                                var entryDataSize = IndexEntry.SIZE + processedKeyData.Length;
+
+                                totalDataSize += entryDataSize;
+
+                                // 检查是否超过int.MaxValue
+                                if (totalDataSize > int.MaxValue)
+                                {
+                                    throw new InvalidOperationException($"Total index size ({totalDataSize}) exceeds maximum allowed size ({int.MaxValue})");
+                                }
+
+                                allIndexData.Add(processedKeyData);
+                                allEntries.Add(kvp);
+                            }
+                        }
+                    }
+                }
+
+                if (allEntries.Count == 0)
+                {
+                    Console.WriteLine("No index entries to merge.");
+                    return true;
+                }
+
+                Console.WriteLine($"Collected {allEntries.Count} entries, total size: {totalDataSize} bytes");
+
+                // 2. 在目标文件创建合并后的索引页
+                var mergedPageSize = (int)totalDataSize;
+                var mergedPageData = CreateMergedIndexPageData(allEntries, allIndexData, mergedPageSize);
+
+                // 3. 写入到目标文件
+                targetFile.Seek(targetFirstIndexDataPosition, SeekOrigin.Begin);
+                targetFile.Write(mergedPageData);
+                targetFile.Flush();
+
+                // 4. 更新目标文件的索引头信息
+                UpdateTargetIndexHeader(targetFile, allEntries.Count, mergedPageSize, targetFirstIndexDataPosition);
+
+                // 5. 更新目标文件的索引块信息
+                UpdateTargetIndexBlocks(targetFile, targetFirstIndexDataPosition, mergedPageSize);
+
+                Console.WriteLine($"Index merge completed: {allEntries.Count} entries merged into {mergedPageSize} bytes at position {targetFirstIndexDataPosition}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during index merge: {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 创建合并后的索引页数据
+    /// </summary>
+    /// <param name="allEntries">所有索引条目</param>
+    /// <param name="allIndexData">所有处理后的key数据</param>
+    /// <param name="pageSize">页面大小</param>
+    /// <returns>合并后的页面数据</returns>
+    private byte[] CreateMergedIndexPageData(List<KeyValuePair<string, IndexEntry>> allEntries,
+                                           List<byte[]> allIndexData,
+                                           int pageSize)
+    {
+        var pageData = new byte[pageSize];
+        var currentOffset = 0;
+
+        // 1. 写入IndexPageHeader
+        fixed (byte* pagePtr = pageData)
+        {
+            var header = (IndexPageHeader*)pagePtr;
+            header->Magic = 0x49445850; // "IDXP"
+            header->EntryCount = allEntries.Count;
+            header->MaxEntries = allEntries.Count;
+            header->UsedSpace = pageSize;
+            header->FreeSpace = 0;
+            header->LastUpdateTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        }
+        currentOffset = 32; // IndexPageHeader.SIZE
+
+        // 2. 写入所有索引条目
+        for (int i = 0; i < allEntries.Count; i++)
+        {
+            var entry = allEntries[i];
+            var processedKeyData = allIndexData[i];
+
+            // 更新条目信息
+            var updatedEntry = entry.Value;
+            updatedEntry.PageIndex = 0; // 合并到第一个页面
+            updatedEntry.KeyLength = processedKeyData.Length;
+            updatedEntry.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            // 写入IndexEntry
+            fixed (byte* pagePtr = pageData)
+            {
+                var entryPtr = (IndexEntry*)(pagePtr + currentOffset);
+                *entryPtr = updatedEntry;
+            }
+            currentOffset += IndexEntry.SIZE;
+
+            // 写入处理后的key数据
+            Array.Copy(processedKeyData, 0, pageData, currentOffset, processedKeyData.Length);
+            currentOffset += processedKeyData.Length;
+        }
+
+        return pageData;
+    }
+
+    /// <summary>
+    /// 更新目标文件的索引头信息
+    /// </summary>
+    /// <param name="targetFile">目标文件</param>
+    /// <param name="entryCount">条目数量</param>
+    /// <param name="pageSize">页面大小</param>
+    /// <param name="regionStartPos">索引区域起始位置</param>
+    private void UpdateTargetIndexHeader(FileStream targetFile, int entryCount, int pageSize, long regionStartPos)
+    {
+        var headerOffset = DatabaseHeader.SIZE + FreeSpaceHeader.SIZE;
+
+        // 创建新的索引头
+        var indexHeader = IndexHeader.Create();
+        indexHeader.IndexPageCount = 1;
+        indexHeader.TotalIndexSize = pageSize;
+        indexHeader.IndexRegionStartPos = regionStartPos;
+        indexHeader.UpdateStats((uint)entryCount, (uint)entryCount, 0);
+        indexHeader.UpdateRebuildTime();
+
+        // 写入索引头
+        var headerBuffer = new byte[IndexHeader.SIZE];
+        fixed (byte* ptr = headerBuffer)
+        {
+            *(IndexHeader*)ptr = indexHeader;
+        }
+
+        targetFile.Seek(headerOffset, SeekOrigin.Begin);
+        targetFile.Write(headerBuffer, 0, IndexHeader.SIZE);
+        targetFile.Flush();
+
+        Console.WriteLine($"Updated target index header: {entryCount} entries, size: {pageSize} bytes");
+    }
+
+    /// <summary>
+    /// 更新目标文件的索引块信息
+    /// </summary>
+    /// <param name="targetFile">目标文件</param>
+    /// <param name="blockPosition">块位置</param>
+    /// <param name="blockSize">块大小</param>
+    private void UpdateTargetIndexBlocks(FileStream targetFile, long blockPosition, int blockSize)
+    {
+        var blocksOffset = DatabaseHeader.SIZE + FreeSpaceHeader.SIZE + IndexHeader.SIZE;
+
+        // 创建索引块数组
+        var blocksBuffer = new byte[IndexHeader.MAX_INDEX_PAGES * IndexBlock.SIZE];
+
+        fixed (byte* ptr = blocksBuffer)
+        {
+            var blockPtr = (IndexBlock*)ptr;
+
+            // 第一个块设置为合并后的索引块
+            blockPtr[0] = new IndexBlock(blockPosition, blockSize);
+
+            // 其余块保持默认（无效）
+            for (int i = 1; i < IndexHeader.MAX_INDEX_PAGES; i++)
+            {
+                blockPtr[i] = new IndexBlock(); // 默认无效块
+            }
+        }
+
+        targetFile.Seek(blocksOffset, SeekOrigin.Begin);
+        targetFile.Write(blocksBuffer, 0, blocksBuffer.Length);
+        targetFile.Flush();
+
+        Console.WriteLine($"Updated target index blocks: first block at position {blockPosition}, size: {blockSize} bytes");
+    }
+
+
 }
 
 /// <summary>
@@ -784,9 +1073,9 @@ public struct IndexStats
     public byte IndexPageCount;
     public byte MaxIndexPages;
     public long TotalIndexSize;
-    public uint TotalEntries;
-    public uint ActiveEntries;
-    public uint DeletedEntries;
+    public int TotalEntries;
+    public int ActiveEntries;
+    public int DeletedEntries;
     public double IndexUtilization;
     public long AveragePageSize;
 

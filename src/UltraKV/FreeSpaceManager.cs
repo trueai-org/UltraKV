@@ -394,7 +394,8 @@ public unsafe class FreeSpaceManager : IDisposable
                     block = _freeBlocks[i];
                     _freeBlocks.RemoveAt(i);
 
-                    var wasteThreshold = Math.Max(64, requiredSize / 4);
+                    // 过大的空闲空间处理，允许一定的浪费
+                    var wasteThreshold = Math.Max(64, requiredSize / 10);
                     if (block.Size > requiredSize + wasteThreshold)
                     {
                         var remainingBlock = new FreeBlock(

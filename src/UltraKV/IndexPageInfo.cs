@@ -185,7 +185,7 @@ public unsafe class IndexPageInfo : IDisposable
             if (offset >= 0)
             {
                 var entryPtr = (IndexEntry*)(_pageBuffer + offset);
-                return entryPtr->IsValidEntry ? entryPtr->Position : -1;
+                return entryPtr->IsValidEntry ? entryPtr->ValuePosition : -1;
             }
             return -1;
         }
