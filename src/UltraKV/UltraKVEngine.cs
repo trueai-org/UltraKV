@@ -1,5 +1,4 @@
-﻿using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
 
 namespace UltraKV;
@@ -8,7 +7,6 @@ public unsafe class UltraKVEngine : IDisposable
 {
     private readonly FileStream _file;
     private readonly FreeSpaceManager _freeSpaceManager;
-    private readonly IndexManager _indexManager; // 新增索引管理器
     private readonly DataProcessor _dataProcessor;
     private readonly DatabaseHeader _databaseHeader;
     private readonly UltraKVConfig _config;
@@ -17,6 +15,7 @@ public unsafe class UltraKVEngine : IDisposable
     private bool _disposed;
     private DateTime _lastFlushTime = DateTime.UtcNow;
     private readonly bool _enableUpdateValidation;
+    private IndexManager _indexManager; // 索引管理器
 
     /// <summary>
     /// 加密数据头部结构
@@ -403,13 +402,13 @@ public unsafe class UltraKVEngine : IDisposable
             {
                 position = freeBlock.Position;
                 indexEntry.ValuePosition = freeBlock.Position;
-                indexEntry.ValueAllocatedSize = (int)freeBlock.Size;
+                indexEntry.ValueAllocatedLength = (int)freeBlock.Size;
             }
             else
             {
                 position = _file.Length;
                 indexEntry.ValuePosition = position;
-                indexEntry.ValueAllocatedSize = multipliedSize;
+                indexEntry.ValueAllocatedLength = multipliedSize;
                 _file.SetLength(position + multipliedSize);
             }
 
@@ -433,84 +432,24 @@ public unsafe class UltraKVEngine : IDisposable
             return null;
 
         // 首先尝试从索引查找
-        var position = _indexManager.FindIndex(key);
-        if (position == -1)
+        if (_indexManager.IndexEntrys.TryGetValue(key, out var indexEntry) && indexEntry.IsValidEntryValue)
         {
-            return null;
-        }
+            _file.Seek(indexEntry.ValuePosition, SeekOrigin.Begin);
 
-        try
-        {
-            _file.Seek(position, SeekOrigin.Begin);
+            var data = new byte[indexEntry.ValueLength];
+            if (_file.Read(data, 0, indexEntry.ValueLength) != indexEntry.ValueLength)
+                return null;
 
             if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
             {
                 // 加密/压缩模式
-                var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
-                if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
-                    return null;
-
-                fixed (byte* headerPtr = encryptedHeaderBuffer)
-                {
-                    var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
-                    if (encryptedHeader.IsDeleted != 0)
-                    {
-                        _indexManager.RemoveIndex(key);
-                        return null;
-                    }
-
-                    var encryptedData = new byte[encryptedHeader.EncryptedSize];
-                    if (_file.Read(encryptedData, 0, (int)encryptedHeader.EncryptedSize) != encryptedHeader.EncryptedSize)
-                        return null;
-
-                    var processedData = _dataProcessor.UnprocessData(encryptedData);
-
-                    fixed (byte* dataPtr = processedData)
-                    {
-                        var record = new Record(dataPtr, processedData.Length);
-                        return record.GetValue();
-                    }
-                }
+                data = _dataProcessor.UnprocessData(data);
             }
-            else
-            {
-                // 非加密模式
-                var headerBuffer = new byte[RecordHeader.SIZE];
-                if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                    return null;
 
-                fixed (byte* headerPtr = headerBuffer)
-                {
-                    var header = *(RecordHeader*)headerPtr;
-                    if (header.IsDeleted != 0)
-                    {;
-                        _indexManager.RemoveIndex(key);
-                        return null;
-                    }
-
-                    var totalDataSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-                    var allData = new byte[totalDataSize];
-
-                    Array.Copy(headerBuffer, allData, RecordHeader.SIZE);
-                    var remainingSize = totalDataSize - RecordHeader.SIZE;
-                    if (remainingSize > 0)
-                    {
-                        _file.Read(allData, RecordHeader.SIZE, remainingSize);
-                    }
-
-                    fixed (byte* dataPtr = allData)
-                    {
-                        var record = new Record(dataPtr, allData.Length);
-                        return record.GetValue();
-                    }
-                }
-            }
+            return Encoding.UTF8.GetString(data);
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error reading key '{key}': {ex.Message}");
-            return null;
-        }
+
+        return null;
     }
 
     public bool Delete(string key)
@@ -645,15 +584,15 @@ public unsafe class UltraKVEngine : IDisposable
 
         if (_indexManager.TryGetValue(key, out var position))
         {
-            // IndexEntry 第一个位置删除标志
-            _file.Seek(position, SeekOrigin.Begin); // EncryptedDataHeader.IsDeleted位置
+            //// IndexEntry 第一个位置删除标志
+            //_file.Seek(position, SeekOrigin.Begin); // EncryptedDataHeader.IsDeleted位置
 
-            var isDeleted = _file.ReadByte();
-            if (isDeleted == 1)
-            {
-                _indexManager.TryRemove(key, out _);
-                return false;
-            }
+            //var isDeleted = _file.ReadByte();
+            //if (isDeleted == 1)
+            //{
+            //    _indexManager.TryRemove(key, out _);
+            //    return false;
+            //}
 
             return true;
         }
@@ -765,19 +704,21 @@ public unsafe class UltraKVEngine : IDisposable
             int validRecords = 0;
             int totalRecordsProcessed = 0;
 
-            // 创建一个 _keyIndex 的副本，如果在文件移动失败时，重置索引副本
-            var originalKeyIndex = new ConcurrentDictionary<string, long>(_keyIndex);
-
             try
             {
-                using var tempFile = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write);
+                using var tempFile = new FileStream(tempFilePath, FileMode.Create, FileAccess.ReadWrite);
 
                 // 写入数据库头部
+
+                // 更新 GC 信息
+                _databaseHeader.UpdateGcTime();
+
                 var headerBytes = new byte[DatabaseHeader.SIZE];
                 fixed (byte* headerPtr = headerBytes)
                 {
                     *(DatabaseHeader*)headerPtr = _databaseHeader;
                 }
+
                 tempFile.Write(headerBytes, 0, DatabaseHeader.SIZE);
 
                 // 创建临时空闲空间管理器
@@ -795,104 +736,55 @@ public unsafe class UltraKVEngine : IDisposable
 
                 // 初始化索引管理器
                 var firstIndexDataStartPosition = tempFreeSpaceManager.GetFirstIndexDataStartPosition();
-                var indexManager = new IndexManager(_file, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
 
-                indexManager.MergeIndexesToTargetFile(tempFile, firstIndexDataStartPosition);
+                // 当前索引管理器，合并索引到临时文件
+                _indexManager.MergeIndexesToTargetFile(tempFile, firstIndexDataStartPosition);
 
-                var newKeyIndex = new ConcurrentDictionary<string, long>();
-                var currentPosition = tempFreeSpaceManager.GetDataStartPosition();
+                var tmpIndexManager = new IndexManager(tempFile, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
+
+                var currentPosition = tempFile.Length;
 
                 // 按键顺序重写所有有效记录
-                foreach (var kvp in _keyIndex.OrderBy(x => x.Key))
+                foreach (var kvp in tmpIndexManager.IndexEntrys)
                 {
-                    var key = kvp.Key;
-                    var oldPosition = kvp.Value;
                     totalRecordsProcessed++;
+                    var key = kvp.Key;
 
-                    try
-                    {
-                        _file.Seek(oldPosition, SeekOrigin.Begin);
+                    var oldPosition = kvp.Value.ValuePosition;
+                    var totalSize = kvp.Value.ValueAllocatedLength;
+                    var recordData = new byte[totalSize];
 
-                        if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
-                        {
-                            // 加密模式：读取 EncryptedDataHeader
-                            var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
-                            if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) != EncryptedDataHeader.SIZE)
-                                continue;
-
-                            fixed (byte* headerPtr = encryptedHeaderBuffer)
-                            {
-                                var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
-                                if (encryptedHeader.IsDeleted != 0)
-                                    continue; // 跳过已删除的记录
-
-                                var totalSize = EncryptedDataHeader.SIZE + (int)encryptedHeader.EncryptedSize;
-
-                                // 读取完整的加密数据块
-                                var fullEncryptedData = new byte[totalSize];
-                                _file.Seek(oldPosition, SeekOrigin.Begin);
-                                if (_file.Read(fullEncryptedData, 0, totalSize) != totalSize)
-                                    continue;
-
-                                // 写入到新文件
-                                tempFile.Seek(currentPosition, SeekOrigin.Begin);
-                                tempFile.Write(fullEncryptedData);
-
-                                // 更新新索引
-                                newKeyIndex[key] = currentPosition;
-                                currentPosition += totalSize;
-                                validRecords++;
-                            }
-                        }
-                        else
-                        {
-                            // 非加密模式：读取 RecordHeader
-                            var headerBuffer = new byte[RecordHeader.SIZE];
-                            if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) != RecordHeader.SIZE)
-                                continue;
-
-                            fixed (byte* headerPtr = headerBuffer)
-                            {
-                                var header = *(RecordHeader*)headerPtr;
-                                if (header.IsDeleted != 0)
-                                    continue; // 跳过已删除的记录
-
-                                var totalSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-                                var recordData = new byte[totalSize];
-
-                                // 读取完整记录
-                                _file.Seek(oldPosition, SeekOrigin.Begin);
-                                if (_file.Read(recordData, 0, totalSize) != totalSize)
-                                    continue;
-
-                                // 写入到新文件
-                                tempFile.Seek(currentPosition, SeekOrigin.Begin);
-                                tempFile.Write(recordData);
-
-                                // 更新新索引
-                                newKeyIndex[key] = currentPosition;
-                                currentPosition += totalSize;
-                                validRecords++;
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Warning: Failed to process record '{key}' during shrink: {ex.Message}");
+                    // 读取完整记录
+                    _file.Seek(oldPosition, SeekOrigin.Begin);
+                    if (_file.Read(recordData, 0, totalSize) != totalSize)
                         continue;
-                    }
+
+                    // 写入到新文件
+                    tempFile.Seek(currentPosition, SeekOrigin.Begin);
+                    tempFile.Write(recordData);
+
+                    // 重置值位置
+                    var ie = kvp.Value;
+                    ie.ValuePosition = currentPosition;
+                    tmpIndexManager.ConfirmIndex(key, ie);
+
+                    currentPosition += totalSize;
+                    validRecords++;
                 }
+
+                tmpIndexManager.SaveChanges();
 
                 // 设置新文件大小
                 tempFile.SetLength(currentPosition);
                 tempFile.Flush();
+                tempFile.Close();
 
                 // 关闭原文件并替换
                 var originalPath = _file.Name;
                 _file.Close();
 
-                // 在移动前需要清空索引，避免读取索引时发现文件不存在了
-                _keyIndex.Clear();
+                // 等待文件系统稳定，避免文件操作冲突
+                Thread.Sleep(10);
 
                 // 这里不能立即删除，而应该先备份
                 if (File.Exists(originalPath))
@@ -907,15 +799,11 @@ public unsafe class UltraKVEngine : IDisposable
                 var newFile = new FileStream(originalPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
                 typeof(UltraKVEngine).GetField("_file", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(this, newFile);
 
-                // 更新索引
-                _keyIndex.Clear();
-                foreach (var kvp in newKeyIndex)
-                {
-                    _keyIndex[kvp.Key] = kvp.Value;
-                }
-
                 // 重新初始化空闲空间管理器
                 _freeSpaceManager.Clear();
+
+                // 重新初始化索引管理器
+                _indexManager = new IndexManager(newFile, _databaseHeader, _dataProcessor, firstIndexDataStartPosition);
 
                 var endTime = DateTimeOffset.UtcNow;
                 var elapsedMs = (long)(endTime - startTime).TotalMilliseconds;
@@ -942,20 +830,13 @@ public unsafe class UltraKVEngine : IDisposable
                     try { File.Delete(tempFilePath); } catch { }
                 }
 
-                // 恢复原始索引
-                _keyIndex.Clear();
-                foreach (var kvp in originalKeyIndex)
-                {
-                    _keyIndex[kvp.Key] = kvp.Value;
-                }
-
                 throw new InvalidOperationException($"Shrink operation failed: {ex.Message}", ex);
             }
         }
     }
 
     /// <summary>
-    /// 获取详细的数据库统计信息，支持加密和非加密格式
+    /// 获取详细的数据库统计信息
     /// </summary>
     public DatabaseStats GetStats()
     {
@@ -963,97 +844,26 @@ public unsafe class UltraKVEngine : IDisposable
         var dataStartPosition = _freeSpaceManager.GetDataStartPosition();
         var actualDataSize = _file.Length - dataStartPosition;
 
+        var indexInfo = _indexManager.GetStats();
+
         // 计算实际使用的数据大小
         long totalRecordSize = 0;
-        long totalOriginalSize = 0; // 解密前的原始大小
-        int validRecordCount = 0;
-        int deletedRecordCount = 0;
-        var compressionSavings = new List<double>();
-
-        foreach (var position in _keyIndex.Values)
-        {
-            try
-            {
-                _file.Seek(position, SeekOrigin.Begin);
-
-                if (_databaseHeader.EncryptionType != EncryptionType.None || _databaseHeader.CompressionType != CompressionType.None)
-                {
-                    // 加密模式：读取 EncryptedDataHeader
-                    var encryptedHeaderBuffer = new byte[EncryptedDataHeader.SIZE];
-                    if (_file.Read(encryptedHeaderBuffer, 0, EncryptedDataHeader.SIZE) == EncryptedDataHeader.SIZE)
-                    {
-                        fixed (byte* headerPtr = encryptedHeaderBuffer)
-                        {
-                            var encryptedHeader = *(EncryptedDataHeader*)headerPtr;
-                            var recordSize = EncryptedDataHeader.SIZE + (int)encryptedHeader.EncryptedSize;
-
-                            if (encryptedHeader.IsDeleted == 0)
-                            {
-                                totalRecordSize += recordSize;
-                                totalOriginalSize += encryptedHeader.OriginalSize;
-                                validRecordCount++;
-
-                                // 计算压缩比
-                                if (encryptedHeader.OriginalSize > 0)
-                                {
-                                    var compressionRatio = (double)encryptedHeader.EncryptedSize / encryptedHeader.OriginalSize;
-                                    compressionSavings.Add(compressionRatio);
-                                }
-                            }
-                            else
-                            {
-                                deletedRecordCount++;
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // 非加密模式：读取 RecordHeader
-                    var headerBuffer = new byte[RecordHeader.SIZE];
-                    if (_file.Read(headerBuffer, 0, RecordHeader.SIZE) == RecordHeader.SIZE)
-                    {
-                        fixed (byte* headerPtr = headerBuffer)
-                        {
-                            var header = *(RecordHeader*)headerPtr;
-                            var recordSize = RecordHeader.SIZE + (int)header.KeyLen + (int)header.ValueLen;
-
-                            if (header.IsDeleted == 0)
-                            {
-                                totalRecordSize += recordSize;
-                                totalOriginalSize += recordSize; // 非加密模式下两者相同
-                                validRecordCount++;
-                            }
-                            else
-                            {
-                                deletedRecordCount++;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Failed to read record at position {position}: {ex.Message}");
-                // 忽略读取错误
-            }
-        }
-
-        // 计算实际压缩比
-        var actualCompressionRatio = compressionSavings.Count > 0 ? compressionSavings.Average() : CalculateCompressionRatio();
+        long totalOriginalSize = 0;
+        int validRecordCount = indexInfo.ActiveEntries;
+        int deletedRecordCount = indexInfo.DeletedEntries;
 
         return new DatabaseStats
         {
             Header = _databaseHeader,
-            KeyCount = _keyIndex.Count,
+            KeyCount = indexInfo.ActiveEntries,
             ValidRecordCount = validRecordCount,
             DeletedRecordCount = deletedRecordCount,
             TotalFileSize = _file.Length,
             DataRegionSize = actualDataSize,
-            UsedDataSize = totalRecordSize,
-            OriginalDataSize = totalOriginalSize, // 新增：原始数据大小（解密前）
+            UsedDataSize = indexInfo.TotalIndexSize,
+            OriginalDataSize = totalOriginalSize,
             FreeSpaceStats = freeSpaceStats,
-            CompressionRatio = actualCompressionRatio,
+            CompressionRatio = 0, // TODO
             FragmentationRatio = freeSpaceStats.FragmentationRatio,
             SpaceUtilization = actualDataSize > 0 ? (double)totalRecordSize / actualDataSize : 0.0,
             EncryptionOverhead = CalculateEncryptionOverhead(totalOriginalSize, totalRecordSize),

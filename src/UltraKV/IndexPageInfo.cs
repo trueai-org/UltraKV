@@ -329,26 +329,34 @@ public unsafe class IndexPageInfo : IDisposable
 
             for (int i = 0; i < header->EntryCount; i++)
             {
-                // 读取IndexEntry
-                var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
-                currentOffset += IndexEntry.SIZE;
-
-                // 读取ProcessedKey数据长度
-                var keyDataLength = entry.KeyLength;
-
-                // 读取ProcessedKey数据
-                var processedKeyData = new byte[keyDataLength];
-                fixed (byte* keyPtr = processedKeyData)
+                try
                 {
-                    Buffer.MemoryCopy(_pageBuffer + currentOffset, keyPtr, keyDataLength, keyDataLength);
+                    // 读取IndexEntry
+                    var entry = *(IndexEntry*)(_pageBuffer + currentOffset);
+                    currentOffset += IndexEntry.SIZE;
+
+                    // 读取ProcessedKey数据长度
+                    var keyDataLength = entry.KeyLength;
+
+                    // 读取ProcessedKey数据
+                    var processedKeyData = new byte[keyDataLength];
+                    fixed (byte* keyPtr = processedKeyData)
+                    {
+                        Buffer.MemoryCopy(_pageBuffer + currentOffset, keyPtr, keyDataLength, keyDataLength);
+                    }
+                    currentOffset += keyDataLength;
+
+                    // 只返回有效条目
+                    if (entry.IsValidEntry)
+                    {
+                        var originalKey = UnprocessKey(processedKeyData);
+                        entries.Add(new KeyValuePair<string, IndexEntry>(originalKey, entry));
+                    }
                 }
-                currentOffset += keyDataLength;
-
-                // 只返回有效条目
-                if (entry.IsValidEntry)
+                catch (Exception ex)
                 {
-                    var originalKey = UnprocessKey(processedKeyData);
-                    entries.Add(new KeyValuePair<string, IndexEntry>(originalKey, entry));
+                    // 处理异常，可能是数据损坏或格式错误
+                    Console.WriteLine($"Error reading entry at offset {currentOffset}: {ex.Message}");
                 }
             }
 

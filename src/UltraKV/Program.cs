@@ -479,12 +479,19 @@ namespace UltraKV
 
             using var engine = new UltraKVEngine(Path.Combine(dataDir, "test.db"), config);
 
-            var x1 = engine.ContainsKey("user:1001"); // 检查键是否存在
+            var x51 = engine.Get("user:1001");
 
             // 添加数据 - 自动更新索引
             engine.Put("user:1001", "John Doe");
             engine.Flush();
-           
+
+            var x1 = engine.ContainsKey("user:1001"); // 检查键是否存在
+            var x2 = engine.Get("user:1001"); // 获取键对应的值
+
+            var x3 = engine.Shrink(true);
+            var x4 = engine.GetStats();
+            var x5 = engine.Get("user:1001");
+
 
             engine.Put("user:1002", "Jane Smith");
             engine.Put("order:5001", "Product A");
@@ -497,7 +504,7 @@ namespace UltraKV
             Console.WriteLine($"Index stats: {indexStats}");
 
             // 手动合并索引页（可选）
-            engine.ConsolidateIndexes();
+            //engine.ConsolidateIndexes();
 
             // 刷新保存索引
             engine.Flush();

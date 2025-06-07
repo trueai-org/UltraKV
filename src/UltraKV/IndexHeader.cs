@@ -34,14 +34,14 @@ public struct IndexBlock
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct IndexEntry
 {
-    public byte IsDeleted;          // 1 byte - 删除标记
-    public byte PageIndex;          // 1 byte - 所在索引页的索引
-    public int KeyLength;           // 4 bytes - Key长度
-    public long ValuePosition;      // 8 bytes - 值数据在文件中的位置，默认：-1，表示未分配
-    public int ValueLength;         // 4 bytes - 值数据真实长度（压缩/加密后）
-    public int ValueAllocatedSize;  // 4 bytes - 值分配空间长度（默认：1.2 倍，用于重写和覆盖）
-    public long Timestamp;          // 8 bytes - 时间戳
-                                    // Total: 30 bytes
+    public byte IsDeleted;           // 1 byte - 删除标记
+    public byte PageIndex;           // 1 byte - 所在索引页的索引
+    public int KeyLength;            // 4 bytes - Key长度
+    public long ValuePosition;       // 8 bytes - 值数据在文件中的位置，默认：-1，表示未分配
+    public int ValueLength;          // 4 bytes - 值数据真实长度（压缩/加密后）
+    public int ValueAllocatedLength; // 4 bytes - 值分配空间长度（默认：1.2 倍，用于重写和覆盖）
+    public long Timestamp;           // 8 bytes - 时间戳
+                                     // Total: 30 bytes
 
     public const int SIZE = 32;
 
@@ -69,7 +69,7 @@ public struct IndexEntry
                $"KeyLen={KeyLength}, " +
                $"ValuePosition: Pos={ValuePosition}, " +
                $"ValueLen={ValueLength}, " +
-               $"ValueAllocSize={ValueAllocatedSize}, " +
+               $"ValueAllocSize={ValueAllocatedLength}, " +
                $"Deleted={IsDeleted}, " +
                $"Timestamp={Timestamp}";
     }
